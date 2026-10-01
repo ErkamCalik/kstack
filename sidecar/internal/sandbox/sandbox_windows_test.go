@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestWindowsHasNoSandbox(t *testing.T) {
@@ -29,9 +28,16 @@ func TestWindowsHasNoSandbox(t *testing.T) {
 
 	var none *Sandbox
 	assert.False(t, none.Confines())
-	cmd := none.Command(context.Background(), Run{Shell: `C:\Windows\System32\cmd.exe`, Args: []string{"/c", "exit"}})
-	require.Error(t, cmd.Start())
-	assert.Nil(t, cmd.Process)
 	_, err := none.Port()
+	assert.ErrorIs(t, err, errNone)
+}
+
+// Command answers errNone and no command, so nothing runs unconfined.
+func TestCommandAnswersErrNone(t *testing.T) {
+	var none *Sandbox
+
+	cmd, err := none.Command(context.Background(), Run{Shell: `C:\Windows\System32\cmd.exe`, Args: []string{"/c", "exit"}})
+
+	assert.Nil(t, cmd)
 	assert.ErrorIs(t, err, errNone)
 }
