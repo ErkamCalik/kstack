@@ -111,4 +111,19 @@ describe('useMemories', () => {
     push({ type: 'Deleted', memory: memory('1', 'renamed', 'c1') });
     expect(render('c1').result.current.memories).toEqual([]);
   });
+
+  it('reports the last save after the Bookmark, never a row of the snapshot', () => {
+    render('c1');
+    push({ type: 'Added', memory: memory('1', 'pages', 'c1') }, { type: 'Bookmark', memory: null });
+    expect(render('c1').result.current.lastSaved).toBeUndefined();
+
+    push(
+      { type: 'Added', memory: memory('2', 'alerts', null) },
+      { type: 'Modified', memory: { ...memory('1', 'pages', 'c1'), body: 'rewritten' } },
+    );
+    expect(render('c1').result.current.lastSaved).toMatchObject({ id: '1', body: 'rewritten' });
+
+    push({ type: 'Deleted', memory: memory('2', 'alerts', null) });
+    expect(render('c1').result.current.lastSaved).toMatchObject({ id: '1' });
+  });
 });
