@@ -3883,8 +3883,11 @@ Implement the panicking stubs it appends to `schema.resolvers.go`. **Never hand-
 
 **A nightly stress run hunts concurrency bugs** (`.github/workflows/stress.yml`, 05:00 UTC, or
 dispatched with `count` and `cpu`). On each of `ci.yml`'s nine runners it runs the whole suite
-with `-race` (but on Windows arm64, which has no race detector), `-cpu 1,4`, `-shuffle=on` and
-`-count=3`. A red run means a test failed under some schedule, nothing else. A test that hangs
+with `-cpu 1,4`, `-shuffle=on` and `-count=3` in two jobs: one with `-race` (but on Windows arm64,
+which has no race detector), and one without it, at full speed, where a timing bug the detector's
+slowdown hides can show. Each job is named by its runner and `race` or `norace`
+(`ubuntu-24.04-norace`), and the issues name it so. A red run means a test failed under some
+schedule, nothing else. A test that hangs
 under `-cpu 1` assumes another goroutine runs beside it: that is a finding. `scripts/stress.go`
 reads the `-json` output into `stress/failures.json` — each failing test, the `-cpu` value it ran
 under and its package's shuffle seed — and the report job files one issue per test, labelled
@@ -3903,6 +3906,9 @@ profiles with `-coverpkg=./...` so a helper exercised from another package count
 the generated files, and fails below `scripts/coverage-threshold`. `make cover-go
 ARGS=-report` lists every file with a gap. The gate is one number in one file: **raise it
 when a change lifts coverage, and never lower it without saying why in the commit body.**
+
+CI runs it with `CGO_ENABLED=0`, as the release is built, so the pure-Go `os/user` and net
+resolver the sidecar ships are tested somewhere: every other CI run has cgo, which `-race` needs.
 
 It measures what the platform builds, so run it on one OS — a `_windows.go` file is not
 compiled on Linux and never enters the denominator. What stays uncovered is deliberate:
