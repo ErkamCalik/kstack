@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The app bar's session control: a sign-in button while the session is absent, the
-// avatar menu once it is there. A session is an add-on, not a gate, so the app runs
-// in both states.
+// The app bar's session control: one avatar in both states, whose menu offers
+// Sign in while the session is absent and Account/Sign out once it is there. A
+// session is an add-on, not a gate, so the app runs signed out too.
 import { LogOut, User, UserRound } from 'lucide-react';
 
 import { AppBarButton } from '@/components/widgets/app-bar-button';
@@ -43,39 +43,42 @@ function initials(s: string): string {
   return trimmed.slice(0, 2).toUpperCase();
 }
 
-export function SignInButton() {
+export function AccountAvatar() {
   const { authState, loading, login, logout } = useAuthState();
-  const { identity } = authState;
+  const { identity, authenticated } = authState;
   // email/name are non-null strings (empty = absent), so `||`, not `??`.
   const label = identity?.name || identity?.email || null;
 
-  if (!authState.authenticated) {
-    return (
-      // `default` rather than the icon size the bar's other controls take: this
-      // one carries a label, so it needs the width and the horizontal padding.
-      <AppBarButton size="default" disabled={loading} onClick={() => login().catch(() => {})}>
-        <User aria-hidden />
-        Sign in
-      </AppBarButton>
-    );
-  }
-
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger render={<AppBarButton />} aria-label={`Account: ${label ?? 'Signed in'}`}>
+      {/* Filled, unlike the bar's other controls: the avatar is an identity, and
+          wears the accent the sidebar's account row does. */}
+      <DropdownMenuTrigger
+        render={<AppBarButton className="rounded-full border-transparent bg-accent text-accent-foreground" />}
+        aria-label={`Account: ${label ?? (authenticated ? 'Signed in' : 'Guest')}`}
+      >
         {label ? <span className="text-xs font-medium">{initials(label)}</span> : <UserRound aria-hidden />}
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" sideOffset={4} className="min-w-44">
-        {/* The account page lives on the web; the host opens it in the browser. */}
-        <DropdownMenuItem onClick={() => invoke(OPEN_ACCOUNT_URL_CMD).catch(() => {})}>
-          <UserRound className="size-4" aria-hidden />
-          Account
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={() => logout().catch(() => {})}>
-          <LogOut className="size-4" aria-hidden />
-          Sign out
-        </DropdownMenuItem>
+        {authenticated ? (
+          <>
+            {/* The account page lives on the web; the host opens it in the browser. */}
+            <DropdownMenuItem onClick={() => invoke(OPEN_ACCOUNT_URL_CMD).catch(() => {})}>
+              <UserRound className="size-4" aria-hidden />
+              Account
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => logout().catch(() => {})}>
+              <LogOut className="size-4" aria-hidden />
+              Sign out
+            </DropdownMenuItem>
+          </>
+        ) : (
+          <DropdownMenuItem disabled={loading} onClick={() => login().catch(() => {})}>
+            <User className="size-4" aria-hidden />
+            Sign in
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
