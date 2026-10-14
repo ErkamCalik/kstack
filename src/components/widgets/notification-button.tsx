@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Notifications button in the app bar's right-hand group, beside Settings. There is
-// no unread-notification source yet, so the badge is a placeholder dot rather than a
-// fabricated count, and the popover holds placeholder copy until that surface is
-// designed.
+// Notifications button in the app bar's right-hand pill, beside Settings. Nothing
+// feeds it yet: the dot and the popover's copy are placeholders.
 import { Bell } from 'lucide-react';
 
 import { Popover, PopoverContent, PopoverTrigger } from '@kubetail/ui/elements/popover';
@@ -27,7 +25,7 @@ export function NotificationButton() {
     <Popover>
       <PopoverTrigger render={<AppBarButton className="relative border-transparent" />} aria-label="Notifications">
         <Bell aria-hidden />
-        <span aria-hidden className="absolute top-1.5 right-1.5 size-1.5 rounded-full bg-primary ring-2 ring-topbar" />
+        <span aria-hidden className="absolute top-1.5 right-1.5 size-1.5 rounded-full bg-primary ring-2 ring-app-bar" />
       </PopoverTrigger>
       <PopoverContent align="end" sideOffset={8} className="w-72">
         <p className="text-sm font-medium">Notifications</p>

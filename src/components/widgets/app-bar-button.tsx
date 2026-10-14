@@ -12,35 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The look every control in the app bar wears, in one place so the buttons and
-// the history pill cannot drift apart.
-import type { ComponentProps } from 'react';
+// The look every control in the app bar wears, in one place so the buttons, the
+// pills and the omnibox cannot drift apart.
+import type { ComponentProps, ReactNode } from 'react';
 import { Button, buttonVariants } from '@kubetail/ui/elements/button';
 import { cn } from '@kubetail/ui/lib/utils';
 
 // `ghost` is the library variant with no resting fill, so the bar's tint shows
 // through and only hover paints. That drops the border with it, hence
-// `border-sidebar-border` — the same border color the floating sidebar card
-// wears, matching the design's pill outline: the button's base already carries
-// `border` at transparent, so a control that is not a `Button` needs the width
-// as well as the color.
+// `border-sidebar-border`: the button's base already carries `border` at
+// transparent, so a control that is not a `Button` needs the width as well as
+// the color.
 const SHAPE = 'rounded-full border-sidebar-border';
 
-// Every control in the bar hovers to the design's `custom/bg-input-80` — a wash
-// over the bar's own tint, not the library's default `hover:bg-muted` (a fixed
-// surface color that would clash with `bg-topbar`). Exported so a control that
-// composes its own hover (the filled avatar, the caption buttons) can still land
-// on the same shade.
-//
-// Needs the `dark:hover:` form too, not just `hover:`: the library's `ghost`
-// variant carries its own `dark:hover:bg-muted/50`, a separate variant chain from
-// plain `hover:`, so `cn`'s tailwind-merge dedupes only a matching chain — leaving
-// the library's dark hover to win unless this names the same one.
-export const APP_BAR_HOVER_CLASS = 'hover:bg-topbar-hover dark:hover:bg-topbar-hover';
+// Hover is a wash over the bar's own tint rather than the library's fixed
+// `bg-muted`. The `dark:` form is needed too: `ghost` carries its own
+// `dark:hover:bg-muted/50`, which tailwind-merge only replaces with a class
+// in the same variant chain.
+export const APP_BAR_HOVER_CLASS = 'hover:bg-app-bar-hover dark:hover:bg-app-bar-hover';
 
 const VARIANTS = { variant: 'ghost', size: 'icon' } as const;
 
-/** For a control that cannot be a `Button` — the history pill's wrapper. */
+/** For a control that cannot be a `Button` — the omnibox's wrapper. */
 export const APP_BAR_CONTROL_CLASS = SHAPE;
 
 /**
@@ -54,4 +47,16 @@ export function appBarButtonClass(className?: string) {
 
 export function AppBarButton({ className, ...props }: ComponentProps<typeof Button>) {
   return <Button {...VARIANTS} className={cn(SHAPE, APP_BAR_HOVER_CLASS, className)} {...props} />;
+}
+
+/**
+ * Two or more controls drawn as one pill. The outline rides the group and the
+ * buttons inside stay ghosts, with an `AppBarDivider` between them.
+ */
+export function AppBarGroup({ children }: { children: ReactNode }) {
+  return <div className={cn('flex h-9 shrink-0 items-center border', SHAPE)}>{children}</div>;
+}
+
+export function AppBarDivider() {
+  return <div className="h-4.5 w-px shrink-0 bg-sidebar-border" aria-hidden />;
 }

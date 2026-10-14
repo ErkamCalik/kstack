@@ -102,9 +102,8 @@ function Segment({
   );
 }
 
-// Presentational only, matching the Figma mockup's dot — there is no live
-// connection-health source wired to the omnibox yet (see `cluster-sync-panel.tsx`
-// for the real per-cluster verdict, computed from data this segment doesn't have).
+// A placeholder: nothing feeds it yet, so it is always green. The real verdict
+// is `cluster-sync-panel.tsx`'s.
 function ClusterDot() {
   return <span aria-hidden className="size-2 shrink-0 rounded-full bg-emerald-500" />;
 }
@@ -192,12 +191,9 @@ export function ContextOmnibox() {
       // its padding should no more move the window than a browser's address bar.
       data-tauri-drag-region="false"
       className={cn(
-        // 44px "hug": no fixed height, so the 32px buttons plus this padding size
-        // it, matching the Figma frame's own hug-contents sizing. The outline is a
-        // `ring`, not a `border`: a real border adds to an auto-sized box on top of
-        // the padding, which is what pushed this to 46px — a ring is a box-shadow,
-        // so it draws inside without touching the layout.
-        'flex w-full max-w-160 items-center bg-background px-1 py-1.5 shadow-sm ring-1 ring-inset ring-topbar-input-border dark:bg-input/30',
+        // 44px tall by content: the 32px buttons plus the padding. The outline
+        // is an inset ring rather than a border, so it adds nothing to that.
+        'flex w-full max-w-160 items-center bg-background px-1 py-1.5 shadow-sm ring-1 ring-inset ring-app-bar-input-border dark:bg-input/30',
         APP_BAR_CONTROL_CLASS,
       )}
     >

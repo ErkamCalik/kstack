@@ -18,10 +18,8 @@
 // and caption buttons; the frameless platforms get `AppMenu` on the left and
 // `WindowControls` on the right.
 // See docs/adr/2026-08-09-per-platform-window-chrome.md
-import { cn } from '@kubetail/ui/lib/utils';
-
 import { AccountAvatar } from '@/components/widgets/account-avatar';
-import { APP_BAR_CONTROL_CLASS } from '@/components/widgets/app-bar-button';
+import { AppBarDivider, AppBarGroup } from '@/components/widgets/app-bar-button';
 import { AppMenu } from '@/components/widgets/app-menu';
 import { ContextOmnibox } from '@/components/widgets/context-omnibox';
 import { HistoryNav } from '@/components/widgets/history-nav';
@@ -58,7 +56,7 @@ export function AppBar() {
     <div
       data-testid="app-bar"
       data-tauri-drag-region="deep"
-      className="flex h-14 shrink-0 transform-gpu items-stretch bg-topbar"
+      className="flex h-14 shrink-0 transform-gpu items-stretch bg-app-bar"
     >
       {mac ? (
         <div
@@ -90,13 +88,11 @@ export function AppBar() {
       {/* 20px from the window's right edge, or from the caption buttons where the
           platform draws them; 8px between the two, as on the left. */}
       <div data-testid="app-bar-actions" className="mr-5 flex items-center gap-2 self-center">
-        {/* Grouped as one pill, like `HistoryNav`'s back/forward pair, since the two
-            read as a unit in the design rather than two separate controls. */}
-        <div className={cn('flex h-9 shrink-0 items-center border', APP_BAR_CONTROL_CLASS)}>
+        <AppBarGroup>
           <NotificationButton />
-          <div className="h-4.5 w-px shrink-0 bg-sidebar-border" aria-hidden />
+          <AppBarDivider />
           <SettingsButton />
-        </div>
+        </AppBarGroup>
         <AccountAvatar />
       </div>
       {!mac && <WindowControls />}

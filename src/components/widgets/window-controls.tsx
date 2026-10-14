@@ -13,8 +13,7 @@
 // limitations under the License.
 
 // Minimize/maximize/close for the frameless Linux/Windows window — no OS caption
-// buttons there. `AppBar` mounts them only off macOS, which draws its own. Every
-// control in the bar hovers to the same `custom/bg-input-80` wash, close included.
+// buttons there. `AppBar` mounts them only off macOS, which draws its own.
 import { Minus, Square, X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -38,8 +37,8 @@ function close() {
     .catch(() => {});
 }
 
-// Shared button styling, hover included: every control in the bar wears the same
-// `custom/bg-input-80` wash.
+// Close hovers like the rest of the bar, not red: these are the bar's controls
+// before they are the OS's.
 const BUTTON_CLASS = `flex h-full w-8 items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${APP_BAR_HOVER_CLASS}`;
 
 const CONTROLS = [

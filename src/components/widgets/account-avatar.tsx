@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The app bar's session control: one avatar, in both states. A session is an
-// add-on, not a gate, so the app runs signed out too — the menu then offers Sign
-// in instead of Account/Sign out, rather than swapping the control for a
-// differently-shaped button.
+// The app bar's session control: one avatar in both states, whose menu offers
+// Sign in while the session is absent and Account/Sign out once it is there. A
+// session is an add-on, not a gate, so the app runs signed out too.
 import { LogOut, User, UserRound } from 'lucide-react';
 
 import { AppBarButton } from '@/components/widgets/app-bar-button';
@@ -52,10 +51,8 @@ export function AccountAvatar() {
 
   return (
     <DropdownMenu>
-      {/* A filled circle rather than a ghost icon button: the avatar is an identity,
-          not a chrome control, so it carries its own accent fill like the sidebar's
-          account row (`left-sidebar-card.tsx`), whether or not there's a session. Its
-          hover still lands on the bar's own wash, like every other control in it. */}
+      {/* Filled, unlike the bar's other controls: the avatar is an identity, and
+          wears the accent the sidebar's account row does. */}
       <DropdownMenuTrigger
         render={<AppBarButton className="rounded-full border-transparent bg-accent text-accent-foreground" />}
         aria-label={`Account: ${label ?? (authenticated ? 'Signed in' : 'Guest')}`}
