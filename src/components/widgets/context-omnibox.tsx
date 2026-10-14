@@ -16,6 +16,7 @@
 // cluster dialog and the cluster in view. The cluster is the window's one scope, and
 // the segment is a quick switch over the same state the clusters dialog writes.
 import type { ReactNode } from 'react';
+import { useState } from 'react';
 
 import { useLocation, useNavigate } from '@tanstack/react-router';
 import { Boxes, Brain, ChevronDown } from 'lucide-react';
@@ -38,6 +39,7 @@ import { useActiveKubeContext } from '@/lib/active-kube-context';
 import { useDialog } from '@/lib/dialog';
 import { tlsUnverifiedReason } from '@/lib/kube-config';
 import { useMemories } from '@/lib/memories';
+import type { Memory } from '@/lib/memories';
 
 const UNVERIFIED_TLS_TITLE: Record<'skip-verify' | 'plain-http', string> = {
   'skip-verify': "The server's certificate is not checked: this context's cluster sets insecure-skip-tls-verify.",
@@ -82,7 +84,7 @@ function Segment({
           <Button
             variant="ghost"
             size="xs"
-            className={cn('min-w-0 shrink rounded-full text-sm font-normal', APP_BAR_HOVER_CLASS)}
+            className={cn('min-w-0 shrink gap-2 rounded-full text-sm font-normal', APP_BAR_HOVER_CLASS)}
           />
         }
         aria-label={`${label}: ${value}`}
@@ -161,12 +163,18 @@ function ClusterSegment() {
   );
 }
 
-// Opens what the window's cluster remembers, lit while it remembers anything.
+// Opens what the window's cluster remembers, lit while it remembers anything, and
+// pulsing once per save: a primary copy of the brain drawn over the base for one
+// run of `--animate-memory-save-pulse` (index.css). Saves that land during a
+// pulse join it rather than restarting it.
 function MemoryButton() {
   const { openDialog } = useDialog();
   const { clusterID } = useActiveCluster();
-  const { memories } = useMemories(clusterID);
+  const { memories, lastSaved } = useMemories(clusterID);
   const lit = memories.length > 0;
+  const [pulsed, setPulsed] = useState<Memory>();
+  const pulsing = lastSaved !== undefined && lastSaved !== pulsed;
+
   return (
     <Button
       variant="ghost"
@@ -174,9 +182,21 @@ function MemoryButton() {
       aria-label="Memory"
       data-lit={lit}
       onClick={() => openDialog('memories')}
-      className={cn('size-8 rounded-full', lit ? 'text-primary' : 'text-muted-foreground', APP_BAR_HOVER_CLASS)}
+      className={cn(
+        'relative size-8 rounded-full',
+        lit ? 'text-primary' : 'text-muted-foreground',
+        APP_BAR_HOVER_CLASS,
+      )}
     >
       <Brain aria-hidden />
+      {pulsing && (
+        <Brain
+          aria-hidden
+          data-testid="memory-save-pulse"
+          className="absolute inset-0 m-auto animate-memory-save-pulse text-primary motion-reduce:animate-memory-save-fade"
+          onAnimationEnd={() => setPulsed(lastSaved)}
+        />
+      )}
     </Button>
   );
 }

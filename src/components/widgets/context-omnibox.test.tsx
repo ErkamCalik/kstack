@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -27,10 +27,30 @@ const { useActiveKubeContextMock, setContext, openDialog } = vi.hoisted(() => ({
 vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
 vi.mock('@/lib/dialog', () => ({ useDialog: () => ({ openDialog }) }));
 
-// What the window's cluster remembers, which lights the memory button.
-const { memoriesState } = vi.hoisted(() => ({ memoriesState: { current: [] as unknown[] } }));
+// What the window's cluster remembers, which lights the memory button. A save
+// notifies like the real watch does, so a memoized button re-renders for it.
+const { memoriesState } = vi.hoisted(() => ({
+  memoriesState: {
+    current: [] as unknown[],
+    lastSaved: undefined as object | undefined,
+    listeners: new Set<() => void>(),
+  },
+}));
 vi.mock('@/lib/active-cluster', () => ({ useActiveCluster: () => ({ clusterID: 'c1' }) }));
-vi.mock('@/lib/memories', () => ({ useMemories: () => ({ memories: memoriesState.current, phase: 'live' }) }));
+vi.mock('@/lib/memories', async () => {
+  const { useSyncExternalStore } = await import('react');
+  const subscribe = (listener: () => void) => {
+    memoriesState.listeners.add(listener);
+    return () => memoriesState.listeners.delete(listener);
+  };
+  return {
+    useMemories: () => ({
+      memories: memoriesState.current,
+      lastSaved: useSyncExternalStore(subscribe, () => memoriesState.lastSaved),
+      phase: 'live',
+    }),
+  };
+});
 
 // The cluster segment navigates itself rather than going through `setContext`, so
 // the router is the seam for what it writes — and for where the window is, which
@@ -72,6 +92,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   location.pathname = '/dashboard';
   memoriesState.current = [];
+  memoriesState.lastSaved = undefined;
   serveContexts(['prod', 'staging']);
 });
 
@@ -112,6 +133,29 @@ describe('ContextOmnibox', () => {
     memoriesState.current = [{ id: 'm1' }];
     render(<ContextOmnibox />);
     expect(screen.getByRole('button', { name: 'Memory' })).toHaveAttribute('data-lit', 'true');
+  });
+
+  it('pulses the brain icon once per memory saved, until the animation ends', () => {
+    const pulse = () => screen.queryByTestId('memory-save-pulse');
+    // jsdom has no `AnimationEvent`, so React listens for the webkit-prefixed name there.
+    const end = () => fireEvent(pulse()!, new Event('webkitAnimationEnd', { bubbles: true }));
+    const save = (memory: object) =>
+      act(() => {
+        memoriesState.lastSaved = memory;
+        memoriesState.listeners.forEach((listener) => listener());
+      });
+
+    render(<ContextOmnibox />);
+    expect(pulse()).not.toBeInTheDocument();
+
+    save({ id: 'm1' });
+    expect(pulse()).toBeInTheDocument();
+    end();
+    expect(pulse()).not.toBeInTheDocument();
+
+    // Another save of the same memory pulses again.
+    save({ id: 'm1' });
+    expect(pulse()).toBeInTheDocument();
   });
 
   it('opens the clusters dialog from the icon', async () => {
