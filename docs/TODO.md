@@ -626,6 +626,17 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 - **Startup URLs don't reference the active kube context.** A fresh window lands on a bare `/chat` (`index.tsx` redirects `/` → `DEFAULT_ROUTE` with no search); `useActiveKubeContext` resolves the context by *falling back* to `kubeConfig.currentContext` but only *writes* `?kubeContext=` on an explicit pick. Consequence: the landing URL isn't self-describing or deep-linkable until the user interacts, and two windows on different default-resolved contexts look identical in the URL. Fix: seed `kubeContext` from the resolved current-context at boot (e.g. `index.tsx` redirect or an `_app` `beforeLoad`). Catch: at `beforeLoad` the clusters stream may not have delivered its first frame, so current-context isn't known synchronously — either accept a sometimes-omitted param or resolve+write once after the first frame lands.
 
+- **The memory button streams every memory to pulse on a save.** `MemoryButton`
+  (`context-omnibox.tsx`) needs two facts: whether the cluster sees any memory, and when one is
+  saved. It reads both off `useMemories`, so every webview holds the full `memoriesWatch` stream,
+  names and bodies included, whether or not the memory dialog is open. That is cheap today: each
+  scope is capped at `ScopeBudget` (4 KiB), so a webview's snapshot is about 8 KiB and a save one
+  memory. **Explore:** a gauge carrying only a count and a save counter for the cluster and every
+  cluster, read by a hook of its own, with the full watch opened by the dialog alone. **Weigh:** the
+  gauge must stay current through deletes and moves between scopes, a second notion of "a save" in
+  the sidecar beside the watch's own diff, and a second subscription while the dialog is open.
+  **Trigger:** `ScopeBudget` or `BodyMax` growing enough that the stream's size shows.
+
 ## Security
 
 The current picture — boundaries, and which protections a test actually pins — is
