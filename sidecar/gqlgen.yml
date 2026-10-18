@@ -299,6 +299,137 @@ models:
   KubeQueryAction:
     model: github.com/kstackhq/kstack/sidecar/internal/tools.KubeQueryAction
 
+  LogsViewAction:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsViewAction
+
+  LogsViewSource:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewSource
+
+  LogsViewSourceKind:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceKind
+    enum_values:
+      Pod:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourcePod
+      Deployment:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceDeployment
+      StatefulSet:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceStatefulSet
+      DaemonSet:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceDaemonSet
+      Job:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceJob
+      CronJob:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceCronJob
+      ReplicaSet:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceReplicaSet
+
+  LogRecord:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Record
+
+  LogGap:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Gap
+
+  LogStream:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.StreamKey
+
+  LogPlace:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Place
+
+  LogRecordsPage:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Page
+
+  LogRecordsPageEdge:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.PageEdge
+
+  LogsViewInput:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.View
+
+  LogsViewSourceInput:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewSource
+
+  LogsViewFilterInput:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewFilter
+
+  LogsFollowFrame:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowFrame
+
+  LogsFollowFrameType:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowFrameType
+    enum_values:
+      Line:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowLine
+      Checkpoint:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowCheckpoint
+      Ended:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowEnded
+
+  LogsFetchMode:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchMode
+    enum_values:
+      Head:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchHead
+      Tail:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchTail
+      Around:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchAround
+
+  LogsViewAnchor:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsViewAnchor
+
+  LogsReadAction:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadAction
+
+  LogsReadLine:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadLine
+
+  LogsWatchAction:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsWatchAction
+
+  LogsReadMode:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadMode
+    enum_values:
+      Head:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadHead
+      Tail:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadTail
+
+  LogsReadEdge:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadEdge
+    enum_values:
+      End:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadEnd
+      More:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadMore
+      Unread:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsReadUnread
+
+  LogsViewAnchorKind:
+    model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsAnchorKind
+    enum_values:
+      Head:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsAnchorHead
+      Tail:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsAnchorTail
+      At:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsAnchorAt
+
+  LogsViewFilter:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewFilter
+
+  LogsViewFilterField:
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.FilterField
+    enum_values:
+      Node:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FilterNode
+      Region:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FilterRegion
+      Zone:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FilterZone
+      Os:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FilterOS
+      Arch:
+        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FilterArch
+
   Citation:
     model: github.com/kstackhq/kstack/sidecar/internal/llm.Citation
 
@@ -328,6 +459,12 @@ models:
         value: github.com/kstackhq/kstack/sidecar/internal/tools.ActionDelegate
       KubeQuery:
         value: github.com/kstackhq/kstack/sidecar/internal/tools.ActionKubeQuery
+      LogsView:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.ActionLogsView
+      LogsRead:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.ActionLogsRead
+      LogsWatch:
+        value: github.com/kstackhq/kstack/sidecar/internal/tools.ActionLogsWatch
 
   ToolCallNetwork:
     model: github.com/kstackhq/kstack/sidecar/internal/agent/chat.ToolCallNetwork
@@ -403,6 +540,10 @@ models:
         value: github.com/kstackhq/kstack/sidecar/internal/agent/chat.BackgroundTaskCompleted
       Failed:
         value: github.com/kstackhq/kstack/sidecar/internal/agent/chat.BackgroundTaskFailed
+      Matched:
+        value: github.com/kstackhq/kstack/sidecar/internal/agent/chat.BackgroundTaskMatched
+      Expired:
+        value: github.com/kstackhq/kstack/sidecar/internal/agent/chat.BackgroundTaskExpired
       Stopped:
         value: github.com/kstackhq/kstack/sidecar/internal/agent/chat.BackgroundTaskStopped
       Lost:

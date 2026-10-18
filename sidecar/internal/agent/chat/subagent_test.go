@@ -36,6 +36,8 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/run/sandbox"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/agent"
+	"github.com/kstackhq/kstack/sidecar/internal/tools/logsread"
+	"github.com/kstackhq/kstack/sidecar/internal/tools/logsview"
 )
 
 // agentCall is a staged Agent call handing on prompt.
@@ -1572,7 +1574,7 @@ func TestASubagentsRuntimeIsItsChatsCluster(t *testing.T) {
 	fakeOf(s).SetToolCalls(agentCall("Look."))
 	subagentFake(s, "Look.").SetToolCalls(llm.StagedCall("where", `{}`))
 
-	msg, err := s.Send(t.Context(), nil, ModeChat, "2", false, false, false, "fake", "fake", "high", reqID("k"), "look")
+	msg, err := s.Send(t.Context(), nil, ModeChat, "2", false, false, false, "fake", "fake", "high", reqID("k"), "look", nil)
 	require.NoError(t, err)
 	awaitSettled(t, s, msg.ChatID, msg.ID)
 	awaitTasks(t, s, msg.ChatID)
@@ -1628,7 +1630,7 @@ func TestTheTurnsToggleReachesItsCommandsAndItsSubagents(t *testing.T) {
 	fakeOf(s).SetToolCalls(llm.StagedCall("net", `{}`), agentCall("Look."))
 	subagentFake(s, "Look.").SetToolCalls(llm.StagedCall("net", `{}`))
 
-	msg, err := s.Send(t.Context(), nil, ModeChat, "2", false, false, true, "fake", "fake", "high", reqID("k"), "look")
+	msg, err := s.Send(t.Context(), nil, ModeChat, "2", false, false, true, "fake", "fake", "high", reqID("k"), "look", nil)
 	require.NoError(t, err)
 	awaitSettled(t, s, msg.ChatID, msg.ID)
 	awaitTasks(t, s, msg.ChatID)
@@ -1649,4 +1651,51 @@ func TestTheTurnsToggleReachesItsCommandsAndItsSubagents(t *testing.T) {
 	rows = toolCallRows(t, s.db, next.RunID)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "network=", rows[0].result)
+}
+
+// A subagent answers its parent's task, not the user's screen: its brief is the
+// newest block without the View.
+func TestTheSubagentsBriefCarriesNoView(t *testing.T) {
+	t.Parallel()
+
+	box, lists := testBox(agent.New())
+	s := startServiceWith(t, t.TempDir(), fakeLLM(), &stubClusterCards{card: "card"}, box, lists)
+	first := send(t, s, nil, "k1", "tail it")
+	awaitSettled(t, s, first.ChatID, first.ID)
+	action := tailWebapp()
+	call := seedViewCall(t, s.db, first.ChatID, "toolu_view", &tools.Action{LogsView: &action})
+
+	sub := subagentFake(s, "Read the lines.")
+	fakeOf(s).SetToolCalls(agentCall("Read the lines."))
+	msg, err := sendWithView(t, s, &first.ChatID, "k2", &Snapshot{CallID: call, Lines: 1})
+	require.NoError(t, err)
+	awaitSettled(t, s, msg.ChatID, msg.ID)
+	awaitTasks(t, s, msg.ChatID)
+
+	parent := questionOf(t, s, msg)[0].Text
+	require.Contains(t, parent, viewHeading)
+	assert.Equal(t, []llm.Message{{Role: "user", Blocks: []llm.Block{
+		llm.ContextBlock(withoutView(parent)),
+		llm.TextBlock("Read the lines."),
+	}}}, sub.LastRequest().Messages)
+}
+
+// A subagent reads logs, with no screen behind the read, and opens no view, which is
+// the user's window.
+func TestASubagentReadsLogsAndOpensNoView(t *testing.T) {
+	t.Parallel()
+	box := SubagentBox(tools.NewBox([]tools.Tool{logsview.New(nil, time.Now), logsread.New(nil, nil, time.Now)}))
+	_, reads := box.Runner(logsread.Name)
+	_, views := box.Runner(logsview.Name)
+	assert.True(t, reads)
+	assert.False(t, views)
+}
+
+// A subagent starts no watch: a watch's point is the turn it starts, and a
+// subagent is gone by the time one fires.
+func TestASubagentStartsNoWatch(t *testing.T) {
+	t.Parallel()
+	box := SubagentBox(tools.NewBox([]tools.Tool{newWatchTool()}))
+	_, watches := box.Runner("LogsWatch")
+	assert.False(t, watches)
 }

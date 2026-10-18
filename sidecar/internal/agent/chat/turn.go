@@ -245,7 +245,7 @@ func (s *service) run(t *turn) (res loop.Result, err error) {
 		Runtime: tools.Runtime{
 			ClusterID: t.clusterID, ChatID: t.chatID, Session: t.session(),
 			Dir: s.chatDir(t.chatID), Tasks: s.chatTasks(t.chatID, t.runJournal), Files: s.chatFiles(t.chatID),
-			Agent: t, ActionAsker: actionAsker{j: t.runJournal, run: t.ctx},
+			Agent: t, Watches: s.chatWatches(t.chatID, t.runJournal), ActionAsker: actionAsker{j: t.runJournal, run: t.ctx},
 		},
 		MaxToolCalls: MaxToolCalls, DefaultToolTimeout: defaultToolTimeout,
 	}
@@ -458,14 +458,14 @@ func (j *runJournal) ToolCallStarted(ctx context.Context, call llm.Block, approv
 // error, and result what the model read either way. A call refused without
 // running gets its first row here, with no started_at: the record of a call that
 // never ran.
-func (j *runJournal) ToolCallFinished(ctx context.Context, call, result llm.Block) error {
+func (j *runJournal) ToolCallFinished(ctx context.Context, call, result llm.Block, shown *tools.Action) error {
 	row := j.openTool
 	if row == nil {
 		row = j.newToolCall(call)
 		j.toolCalls = append(j.toolCalls, row)
 	}
 	j.openTool, j.toolSeq = nil, j.toolSeq+1
-	row.Status, row.Result, row.Error = toolSucceeded, result.Text, ""
+	row.Status, row.Result, row.Error, row.Shown = toolSucceeded, result.Text, "", shown
 	if result.IsError {
 		row.Status, row.Error = toolFailed, toolError(result.Text)
 		if code, _ := loop.RefusalOf(result.Text); row.IsMutating && code == loop.CodeDenied {

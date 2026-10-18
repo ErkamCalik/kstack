@@ -1156,28 +1156,40 @@ enum ToolActionKind {
   Memory
   Delegate
   KubeQuery
+  LogsView
+  LogsRead
+  LogsWatch
 }
 
-"A command started with `run_in_background`, or an agent an `Agent` call launched, off its `background_tasks` row."
+"A command started with `run_in_background`, an agent an `Agent` call launched, or a watch a `LogsWatch` call started, off its `background_tasks` row."
 type BackgroundTask {
   status: BackgroundTaskStatus!
   "Set on an `Exited` task whose code could be read."
   exitCode: Int
   "A `Completed` agent's report, cut to the inline limit. Empty for a command, and until the agent completes."
   report: String!
+  "A finished watch's lines, oldest first, as the model read them: stripped, redacted and cut. Empty for every other task and while a watch runs. Cluster text."
+  matched: [LogsReadLine!]!
+  "Why a finished watch ended, in the words its notice used. Empty for every other task and while a watch runs."
+  endedBecause: String!
+  "The view `View around this` opens: the watch's view at its first line's moment, unpinned. Null with no line, and for every other task."
+  viewAround: LogsViewAction
 }
 
 """
 Where a background task is. A command ends `Exited`; an agent `Completed` (it answered) or
-`Failed` (it could not). `Stopped` was ended by the model, the user, the app's quit, or an agent's
-request that went unanswered; `Lost` was running when the sidecar stopped unexpectedly, and a
-command may still be running.
+`Failed` (it could not); a watch `Matched` (it held lines, however it ended), `Expired` (its time
+ran out with none) or `Failed` (an error, or its pods went away, with none). `Stopped` was ended by the model,
+the user, the app's quit, or an agent's request that went unanswered; `Lost` was running when the
+sidecar stopped unexpectedly, and a command may still be running.
 """
 enum BackgroundTaskStatus {
   Running
   Exited
   Completed
   Failed
+  Matched
+  Expired
   Stopped
   Lost
 }
@@ -1195,6 +1207,151 @@ type ToolAction {
   memory: MemoryAction
   delegate: DelegateAction
   kubeQuery: KubeQueryAction
+  logsView: LogsViewAction
+  logsRead: LogsReadAction
+  logsWatch: LogsWatchAction
+}
+
+"A live view of logs the user is looking at, as the sidecar hands it to the log backend."
+type LogsViewAction {
+  "What the view reads, in the order asked. Their lines are merged by timestamp."
+  sources: [LogsViewSource!]!
+  "What the view keeps of its sources' lines. Empty keeps every line."
+  filters: [LogsViewFilter!]!
+  "A regular expression each line's message must match; empty for none. The model wrote it, so draw it as text."
+  grep: String!
+  anchor: LogsViewAnchor!
+  "Whether the viewer keeps the end in view as lines arrive. Lines arrive either way; the user can unpin it by hand."
+  pinToEnd: Boolean!
+  "When the sidecar resolved the view, on its clock."
+  resolvedAt: Time!
+}
+
+"What a LogsRead call read: the view, the range, and the lines the model read."
+type LogsReadAction {
+  "The view read, as LogsView resolves one."
+  sources: [LogsViewSource!]!
+  filters: [LogsViewFilter!]!
+  "The model wrote it, so draw it as text."
+  grep: String!
+  "The range's ends as moments: a cursor's line's timestamp, or the resolved moment. Null for an open end."
+  since: Time
+  until: Time
+  "Which end of the range the sample came from."
+  mode: LogsReadMode!
+  "When the sidecar resolved the read, on its clock."
+  resolvedAt: Time!
+  "The lines the model read, oldest first, as it read them: stripped, redacted and cut. Cluster text."
+  lines: [LogsReadLine!]!
+  "Lines past the sample's budget, left out."
+  dropped: Int!
+  "What lies before the first line and after the last."
+  before: LogsReadEdge!
+  after: LogsReadEdge!
+  "Every stream the read could not read, one line each. Cluster text."
+  skipped: [String!]!
+  "The view `View around this` opens: the read's view at its first line's moment, unpinned. Null with no line."
+  viewAround: LogsViewAction
+}
+
+"What a LogsWatch call watches: the view, the pattern, and its bounds."
+type LogsWatchAction {
+  "The view watched, as LogsView resolves one."
+  sources: [LogsViewSource!]!
+  filters: [LogsViewFilter!]!
+  "Empty watches for any line. The model wrote it, so draw it as text."
+  grep: String!
+  "Where the window starts: the call's `since`, resolved, or `resolvedAt` with none."
+  since: Time!
+  "How many matching lines end the watch, and how many bytes of them."
+  limit: Int!
+  maxBytes: Int!
+  "When the sidecar started the watch, on its clock."
+  resolvedAt: Time!
+  "When the watch ends on time alone: the call's `until`, cut to a day, else a day after `resolvedAt`."
+  until: Time!
+}
+
+"Which end of its range a read's sample came from: the oldest lines, or the newest."
+enum LogsReadMode {
+  Head
+  Tail
+}
+
+"What lies past one end of a sample."
+enum LogsReadEdge {
+  "Nothing: the read reached the start of the log, or the live end."
+  End
+  "Lines the read did not return: it hit its limit or its budget, or it was continued from a cursor on this side."
+  More
+  "Lines there may be: a moment was given on this side and the read stopped at it without looking past."
+  Unread
+}
+
+"One line of a sample. Cluster text, so draw it as text."
+type LogsReadLine {
+  timestamp: Time!
+  namespace: String!
+  pod: String!
+  container: String!
+  previous: Boolean!
+  message: String!
+  "The hole before this line, as the viewer's `gap`."
+  gap: LogGap
+}
+
+"Where a view opens: an edge of the stream, or a moment in it."
+type LogsViewAnchor {
+  kind: LogsViewAnchorKind!
+  "The moment. Set for At alone."
+  at: Time
+}
+
+"The oldest line the backend keeps, the newest, or a moment between."
+enum LogsViewAnchorKind {
+  Head
+  Tail
+  At
+}
+
+"One resource whose logs a view reads. Every name came from the cluster or the model, so draw them as text."
+type LogsViewSource {
+  namespace: String!
+  kind: LogsViewSourceKind!
+  name: String!
+  "The containers read, by exact name. Empty reads each pod's default container, as `kubectl logs` picks it, unless allContainers is set."
+  containers: [String!]!
+  "Every container of each pod, when no container is named."
+  allContainers: Boolean!
+  "The instance before the last restart, rather than the running one. Finished: nothing arrives on it."
+  previous: Boolean!
+}
+
+"The kinds the log backend reads: a pod, or a workload whose pods it follows."
+enum LogsViewSourceKind {
+  Pod
+  Deployment
+  StatefulSet
+  DaemonSet
+  Job
+  CronJob
+  ReplicaSet
+}
+
+"One filter on a view's lines: the values its field may take."
+type LogsViewFilter {
+  field: LogsViewFilterField!
+  "The values allowed. Never empty."
+  values: [String!]!
+}
+
+"What a line can be filtered by: the node it ran on, and the node's labels."
+enum LogsViewFilterField {
+  Node
+  Region
+  Zone
+  Os
+  Arch
 }
 
 "A statement over the chat's cluster's cache. The model wrote it, so draw it as text."
@@ -1359,6 +1516,157 @@ type ChatMessageWatchFrame {
   type: DeltaFrameType!
   "The affected message. On `Deleted`, its last-known state; remove by `id`. Null on `Bookmark`."
   message: ChatMessage
+}
+
+# --- Logs ---
+# A view's lines, read through the API server with the user's own credentials. The
+# view is the backend's half of a LogsViewAction; the anchor and the pin are the
+# viewer's.
+
+"One log line, as the sidecar read it. Every string came from the cluster, so draw it as text."
+type LogRecord {
+  "When the container runtime stamped it."
+  timestamp: Time!
+  "The line, with terminal control sequences stripped and cut at 16 KiB."
+  message: String!
+  stream: LogStream!
+  place: LogPlace!
+  "Names this line: a fetch's cursor argument or a follow's `after` resumes past it. Opaque."
+  cursor: String!
+  "Set when lines of this stream may be missing just before this line. Null when none are."
+  gap: LogGap
+}
+
+"""
+Lines of a stream that neither the cluster nor the log cache holds. They lie before the line that
+carries the gap.
+"""
+type LogGap {
+  "When the last known line before the hole was stamped."
+  after: Time!
+  "When the first known line past the hole was stamped: the carrying line's own stamp, unless the grep hid the lines between."
+  before: Time!
+}
+
+"The log a line came from. Its four fields together name the stream."
+type LogStream {
+  namespace: String!
+  pod: String!
+  container: String!
+  "Whether the log is the instance before the last restart."
+  previous: Boolean!
+}
+
+"Where a stream's pod runs: its node and the node's labels. Empty where the mirror does not know. It takes no part in naming the stream."
+type LogPlace {
+  node: String!
+  region: String!
+  zone: String!
+  os: String!
+  arch: String!
+}
+
+"One edge of a page: where the next page that way continues from, and whether there is one."
+type LogRecordsPageEdge {
+  "Opaque. A page's cursor, never a line's. Null on a `before` edge with nothing older."
+  cursor: String
+  more: Boolean!
+}
+
+"A page of a view's lines, oldest first in position order, whatever the mode."
+type LogRecordsPage {
+  records: [LogRecord!]!
+  before: LogRecordsPageEdge!
+  after: LogRecordsPageEdge!
+  "For `Around`: the index of the first record at or after `at`, `records.length` with none. Null for the other modes."
+  anchor: Int
+  "Streams the page could not read, one line each, in the sidecar's words. Empty when every stream answered."
+  skipped: [String!]!
+}
+
+"What a view reads: the `LogsViewAction` fields the backend takes, as an input."
+input LogsViewInput {
+  sources: [LogsViewSourceInput!]!
+  filters: [LogsViewFilterInput!]!
+  grep: String!
+}
+
+input LogsViewSourceInput {
+  namespace: String!
+  kind: LogsViewSourceKind!
+  name: String!
+  containers: [String!]!
+  allContainers: Boolean!
+  previous: Boolean!
+}
+
+input LogsViewFilterInput {
+  field: LogsViewFilterField!
+  values: [String!]!
+}
+
+"What the user's open log view shows as they send. The sidecar reads the view itself from the call."
+input LogsViewSnapshotInput {
+  "The `LogsView`, `LogsRead` or `LogsWatch` call whose view is open. It must be a call of the chat the send is to; a `LogsRead` one must have a `viewAround`, and a `LogsWatch` one a finished task with one."
+  callID: ToolCallID!
+  "The first and last visible line's timestamps. Both null when no line is on screen."
+  from: Time
+  to: Time
+  "How many lines are on screen."
+  lines: Int!
+  "Whether the newest line is on screen and the viewer is following."
+  atEnd: Boolean!
+  "Whether the viewer keeps the end in view."
+  pinnedToEnd: Boolean!
+  "Whether the user paused the viewer: no line arrives until they resume."
+  paused: Boolean!
+  "The selected lines, in order, at most 50."
+  selected: [LogsViewSelectedLineInput!]!
+  "How many lines are selected, `selected` included."
+  selectedCount: Int!
+}
+
+"One selected line, as the viewer holds it. Cluster text."
+input LogsViewSelectedLineInput {
+  timestamp: Time!
+  namespace: String!
+  pod: String!
+  container: String!
+  previous: Boolean!
+  message: String!
+}
+
+"""
+One frame of a follow: a line, a checkpoint, or the last frame, saying why the follow ended.
+Following again after `Ended` would end the same way. Detect each frame by `type`, never by
+which field is missing.
+"""
+type LogsFollowFrame {
+  type: LogsFollowFrameType!
+  "The line. Null on `Checkpoint` and `Ended`."
+  record: LogRecord
+  "A follow opened `after` it misses no line. Null on `Line` and `Ended`."
+  cursor: String
+  "Why the follow ended, in the user's words. Empty on `Line` and `Checkpoint`."
+  reason: String!
+}
+
+enum LogsFollowFrameType {
+  Line
+  Checkpoint
+  Ended
+}
+
+"""
+Which page of a view to read. `Head` reads oldest first after `cursor`, from the start with
+none; `Tail` reads newest first before `cursor`, from the end with none; `Around` reads
+`limit` lines before `at` and `limit` from it on, so its page holds up to twice `limit`, and
+needs `at` and no cursor.
+"""
+enum LogsFetchMode {
+  Head
+  Tail
+  Around
 }
 
 # --- Memory ---
@@ -1689,6 +1997,23 @@ type Query {
   "The chat's own rules, each as Settings spells a rule. Empty for a chat with none."
   chatGrants(chatID: ChatID!): [PermissionRule!]!
 
+  # --- Logs ---
+  """
+  A page of a view's lines on the cluster. A cursor names a line and is opaque: send
+  back the one a page handed out. A time alone names a moment. `since` and `until`
+  include the cursor's line, `after` and `before` do not. With no cursor, `Head` reads
+  from the oldest line and `Tail` from the newest. `limit` is at most 500.
+  """
+  logsFetch(
+    id: ClusterID!
+    view: LogsViewInput!
+    mode: LogsFetchMode!
+    cursor: String
+    at: Time
+    "From 1 to 500: the lines in a page, or on each side of `at` for `Around`."
+    limit: Int!
+  ): LogRecordsPage!
+
   # --- Cloud account ---
   "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
   authState: AuthState!
@@ -1720,8 +2045,8 @@ type Mutation {
   clusterCachedKindSyncEnabledSet(id: ObjectID!, syncEnabled: Boolean!): ClusterCachedKind!
 
   # --- Chat ---
-  "Save a user message and start the assistant's turn. Returns the assistant's message as accepted, not as finished — the answer arrives on chatMessagesWatch. A null `chatID` creates the chat; a chat already running a turn is refused. `requestID` makes the send idempotent for as long as its chat lives, and a repeat is answered by that id alone: this call's `chatID`, `model`, `effort` and `content` are ignored. The key goes with the chat, so a repeat after its delete is a new send. A null `chatID` creates the chat in `mode` and under `clusterID`, which must name an existing cluster; otherwise both are ignored, and on a `requestID` replay they are ignored like `chatID` and `content`. `sandboxDisabled` is the chat's switch as the sender saw it, `false` for a chat the send creates; a send whose switch differs from the chat's is refused with `KSTACK_CHAT_SANDBOX_CHANGED`, and a replay ignores it too. `networkEnabled` is the chat's network switch as the sender saw it, `false` for a chat the send creates; a send whose switch differs from the chat's is refused with `KSTACK_CHAT_NETWORK_CHANGED`, and a replay ignores it. `networkThisTurn` gives every command of this turn the internet, its subagents' included; refused with `KSTACK_VALIDATION_ERROR` where network is unavailable."
-  chatSend(chatID: ChatID, mode: ChatMode!, clusterID: ClusterID!, sandboxDisabled: Boolean!, networkEnabled: Boolean!, networkThisTurn: Boolean!, providerID: String!, modelID: String!, effort: String!, requestID: String!, content: String!): ChatMessage!
+  "Save a user message and start the assistant's turn. Returns the assistant's message as accepted, not as finished — the answer arrives on chatMessagesWatch. A null `chatID` creates the chat; a chat already running a turn is refused. `requestID` makes the send idempotent for as long as its chat lives, and a repeat is answered by that id alone: this call's `chatID`, `model`, `effort` and `content` are ignored. The key goes with the chat, so a repeat after its delete is a new send. A null `chatID` creates the chat in `mode` and under `clusterID`, which must name an existing cluster; otherwise both are ignored, and on a `requestID` replay they are ignored like `chatID` and `content`. `sandboxDisabled` is the chat's switch as the sender saw it, `false` for a chat the send creates; a send whose switch differs from the chat's is refused with `KSTACK_CHAT_SANDBOX_CHANGED`, and a replay ignores it too. `networkEnabled` is the chat's network switch as the sender saw it, `false` for a chat the send creates; a send whose switch differs from the chat's is refused with `KSTACK_CHAT_NETWORK_CHANGED`, and a replay ignores it. `networkThisTurn` gives every command of this turn the internet, its subagents' included; refused with `KSTACK_VALIDATION_ERROR` where network is unavailable. `snapshot` is what the user's open log view shows, which rides the question as its context's View; a snapshot naming no `LogsView`, `LogsRead` or `LogsWatch` call of this chat, or on a send that creates one, is refused with `KSTACK_VALIDATION_ERROR`, and a replay ignores it."
+  chatSend(chatID: ChatID, mode: ChatMode!, clusterID: ClusterID!, sandboxDisabled: Boolean!, networkEnabled: Boolean!, networkThisTurn: Boolean!, providerID: String!, modelID: String!, effort: String!, requestID: String!, content: String!, snapshot: LogsViewSnapshotInput): ChatMessage!
 
   "Stop the in-flight turn, keeping the partial answer. Returns true; a no-op when nothing is running."
   chatCancel(chatID: ChatID!): Boolean!
@@ -1879,6 +2204,16 @@ type Subscription {
   # --- Memory ---
   "DELTA WATCH. What one cluster's chats see, keyed by `memory.id`: its own memories and every cluster's. A move between scopes arrives as `Added` or `Deleted` on each cluster it enters or leaves."
   memoriesWatch(clusterID: ClusterID!): MemoryWatchFrame!
+
+  # --- Logs ---
+  """
+  A view's new lines as they are written, after the cursor, or from now with none.
+  Lines are ordered per container, and across containers by arrival. A follow that
+  ends for a reason the user can read sends one `Ended` frame and completes: stop
+  subscribing. One that fails reports `watchFailed`; follow again with `after` set
+  to the last line's cursor.
+  """
+  logsFollow(id: ClusterID!, view: LogsViewInput!, after: String): LogsFollowFrame!
 
   # --- Sandbox ---
   "GAUGE. The executable probe: whether one runs, and the report as the last one left it, a fresh value on each start, each end and each change to the registered executables."

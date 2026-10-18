@@ -15,9 +15,14 @@
 package tools
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
 )
 
 // An action's kind is the field it sets, and none for an action that sets none.
@@ -31,6 +36,9 @@ func TestAnActionsKindIsItsField(t *testing.T) {
 	assert.Equal(t, ActionMemory, Action{Memory: &MemoryAction{}}.Kind())
 	assert.Equal(t, ActionDelegate, Action{Delegate: &DelegateAction{}}.Kind())
 	assert.Equal(t, ActionKubeQuery, Action{KubeQuery: &KubeQueryAction{}}.Kind())
+	assert.Equal(t, ActionLogsView, Action{LogsView: &LogsViewAction{}}.Kind())
+	assert.Equal(t, ActionLogsRead, Action{LogsRead: &LogsReadAction{}}.Kind())
+	assert.Equal(t, ActionLogsWatch, Action{LogsWatch: &LogsWatchAction{}}.Kind())
 	assert.Equal(t, ActionKind(""), Action{Description: "no kind"}.Kind())
 }
 
@@ -42,7 +50,32 @@ func TestActionKindsIsTheSet(t *testing.T) {
 		seen[k] = true
 		assert.True(t, k.valid(), k)
 	}
-	assert.Len(t, ActionKinds, 10)
+	assert.Len(t, ActionKinds, 13)
 	assert.False(t, ActionKind("").valid())
 	assert.False(t, ActionKind("unknown").valid())
+}
+
+// A view's backend half is the log service's input, and the action's JSON keeps
+// its flat shape: the row stores it as written.
+func TestLogsViewActionEmbedsTheInput(t *testing.T) {
+	at := time.Date(2026, 10, 8, 14, 0, 0, 0, time.UTC)
+	action := LogsViewAction{
+		LogsViewInput: LogsViewInput{
+			Sources: []LogsViewSource{{Namespace: "prod", Kind: LogsSourceDeployment, Name: "web", Containers: []string{"app"}}},
+			Filters: []LogsViewFilter{{Field: LogsFilterZone, Values: []string{"a"}}},
+			Grep:    "err",
+		},
+		Anchor:     LogsViewAnchor{Kind: LogsAnchorAt, At: &at},
+		PinToEnd:   true,
+		ResolvedAt: at.Add(time.Minute),
+	}
+
+	raw, err := json.Marshal(action)
+
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"sources":[{"namespace":"prod","kind":"deployment","name":"web","containers":["app"],"allContainers":false,"previous":false}],
+"filters":[{"field":"zone","values":["a"]}],"grep":"err","anchor":{"kind":"at","at":"2026-10-08T14:00:00Z"},"pinToEnd":true,
+"resolvedAt":"2026-10-08T14:01:00Z"}`, string(raw))
+	var view logs.View = action.LogsViewInput
+	assert.Equal(t, "err", view.Grep)
 }

@@ -87,6 +87,9 @@ func (f *fakeClusterService) Start(context.Context) (func(context.Context) error
 
 func (f *fakeClusterService) Close() error { return nil }
 
+// SetCacheFiles is the composition root's wiring; no resolver calls it.
+func (f *fakeClusterService) SetCacheFiles(cluster.CacheFileOwner) {}
+
 var (
 	_ cluster.Service     = (*fakeClusterService)(nil)
 	_ cluster.Clusters    = fakeClusters{}
@@ -458,8 +461,16 @@ func (f fakeCachedData) ListObjects(context.Context, cluster.ClusterID, cluster.
 	return nil, false, nil
 }
 
-func (f fakeCachedData) Query(context.Context, cluster.ClusterID, cluster.ClusterCacheID, string, int, int) (cluster.ClusterCachedDataQueryResult, bool, error) {
+func (f fakeCachedData) Query(context.Context, cluster.ClusterID, cluster.ClusterCacheID, string, int, int, ...any) (cluster.ClusterCachedDataQueryResult, bool, error) {
 	return cluster.ClusterCachedDataQueryResult{}, false, nil
+}
+
+func (f fakeCachedData) ReadOwn(context.Context, cluster.ClusterID, cluster.ClusterCacheID, func(cluster.OwnQuery) error) (bool, error) {
+	return false, nil
+}
+
+func (f fakeCachedData) ReadActive(ctx context.Context, id cluster.ClusterID, maxRows, maxBytes int, read func(cluster.CacheReading, cluster.ActiveCluster) error) error {
+	return cluster.ReadActiveCache(ctx, f.s, id, maxRows, maxBytes, read)
 }
 
 func (f fakeCachedData) ListKinds(_ context.Context, clusterID cluster.ClusterID, _ cluster.ClusterCacheID) ([]cluster.ClusterCachedDataKind, error) {
@@ -500,6 +511,10 @@ func (f fakeCachedData) WatchEvents(ctx context.Context, clusterID cluster.Clust
 		<-ctx.Done()
 		return nil
 	}), nil
+}
+
+func (f fakeCachedData) WatchObjectsIn(ctx context.Context, clusterID cluster.ClusterID, cacheID cluster.ClusterCacheID, apiVersion, resource string, _ []string) (*cluster.Stream[cluster.ClusterCachedDataObjectWatchFrame], error) {
+	return f.WatchObjects(ctx, clusterID, cacheID, apiVersion, resource)
 }
 
 func (f fakeCachedData) WatchObjects(ctx context.Context, clusterID cluster.ClusterID, _ cluster.ClusterCacheID, _, _ string) (*cluster.Stream[cluster.ClusterCachedDataObjectWatchFrame], error) {
@@ -1013,12 +1028,20 @@ func (e errCachedData) WatchObjects(context.Context, cluster.ClusterID, cluster.
 	return nil, e.err
 }
 
+func (e errCachedData) WatchObjectsIn(context.Context, cluster.ClusterID, cluster.ClusterCacheID, string, string, []string) (*cluster.Stream[cluster.ClusterCachedDataObjectWatchFrame], error) {
+	return nil, e.err
+}
+
 func (e errCachedData) ListObjects(context.Context, cluster.ClusterID, cluster.ClusterCacheID, string, string) ([]cluster.ClusterCachedDataObject, bool, error) {
 	return nil, false, e.err
 }
 
-func (e errCachedData) Query(context.Context, cluster.ClusterID, cluster.ClusterCacheID, string, int, int) (cluster.ClusterCachedDataQueryResult, bool, error) {
+func (e errCachedData) Query(context.Context, cluster.ClusterID, cluster.ClusterCacheID, string, int, int, ...any) (cluster.ClusterCachedDataQueryResult, bool, error) {
 	return cluster.ClusterCachedDataQueryResult{}, false, e.err
+}
+
+func (e errCachedData) ReadOwn(context.Context, cluster.ClusterID, cluster.ClusterCacheID, func(cluster.OwnQuery) error) (bool, error) {
+	return false, e.err
 }
 
 // errAuth fails Current and Logout; the login flow's own failure arm is covered

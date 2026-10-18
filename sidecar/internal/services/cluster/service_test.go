@@ -45,7 +45,7 @@ func newTestService(t *testing.T) Service {
 // mirror apart, since it is what Kstack can lose.
 func TestTheMirrorIsInTheCacheDirectory(t *testing.T) {
 	data, cache := t.TempDir(), t.TempDir()
-	paths := Paths{BeehiveDBFile: filepath.Join(data, "beehive.db"), KubestoreDir: filepath.Join(cache, "kubestore")}
+	paths := Paths{BeehiveDBFile: filepath.Join(data, "beehive.db"), KubestoreDir: filepath.Join(cache, "kube")}
 	svc, err := New(openTestDB(t), paths, newTestKubeconfig(t), nil)
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, svc.Close()) }()
@@ -55,7 +55,7 @@ func TestTheMirrorIsInTheCacheDirectory(t *testing.T) {
 	store.Release()
 
 	assert.FileExists(t, paths.BeehiveDBFile)
-	assert.FileExists(t, filepath.Join(cache, "kubestore", "1.db"))
+	assert.FileExists(t, filepath.Join(cache, "kube", "1.db"))
 }
 
 // The accessors are stateless views onto the one service, so each returns something
@@ -81,6 +81,25 @@ func TestStartStopClose(t *testing.T) {
 	testutil.WaitReturn(t, func() { assert.NoError(t, stop(context.Background())) }, "stop to return")
 
 	assert.NoError(t, svc.Close())
+}
+
+// The log files arrive by SetCacheFiles, once the logs service exists; a pass that
+// reaches them before that fails rather than leaving a file behind.
+func TestSetCacheFilesHandsThePassesTheOwner(t *testing.T) {
+	svc, err := New(openTestDB(t), testPaths(t), newTestKubeconfig(t), nil)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, svc.Close()) }()
+	files := svc.(*service).cacheFiles
+
+	assert.ErrorContains(t, files.Clear(1), "cache file owner")
+	assert.ErrorContains(t, files.Remove(1), "cache file owner")
+
+	owner := &fakeCacheFiles{}
+	svc.SetCacheFiles(owner)
+	require.NoError(t, files.Clear(1))
+	require.NoError(t, files.Remove(2))
+	assert.Equal(t, []int64{1}, owner.cleared)
+	assert.Equal(t, []int64{2}, owner.removed)
 }
 
 // A path that cannot hold the store is a startup failure, not a

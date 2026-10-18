@@ -90,6 +90,10 @@ type Service interface {
 	Start(ctx context.Context) (func(context.Context) error, error)
 	// Close releases the boundary's resources. Call after the stop func returns.
 	Close() error
+	// SetCacheFiles hands the passes the log files a cache's clear and removal reach.
+	// The app calls it once the logs service exists and before Start, so no pass meets
+	// it unset; one that did would fail rather than leave a file behind.
+	SetCacheFiles(CacheFileOwner)
 
 	Clusters() Clusters
 	Caches() Caches
@@ -311,15 +315,33 @@ type CachedData interface {
 	// WatchObjects streams one kind's cached objects as a delta watch keyed by UID.
 	// No frames while that kind hasn't synced.
 	WatchObjects(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (*Stream[ClusterCachedDataObjectWatchFrame], error)
+	// WatchObjectsIn is WatchObjects narrowed to the objects in namespaces, each
+	// frame carrying no body: a watcher that wants to know what moved, not what it
+	// holds, pays for neither the rest of the cluster nor the bodies.
+	WatchObjectsIn(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string, namespaces []string) (*Stream[ClusterCachedDataObjectWatchFrame], error)
 	// WatchEvents streams one cache's cached Kubernetes Events, newest first, as a
 	// delta watch keyed by event UID. Woken separately from WatchKinds, so an event
 	// burst never drives the kind-catalog re-read.
 	WatchEvents(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCachedDataEventWatchFrame], error)
 	// Query runs one statement over the cache's views on a read-only connection of its
-	// own, and answers at most maxRows rows and maxBytes of cells. ok is false for a
+	// own, with args bound to its placeholders, and answers at most maxRows rows and
+	// maxBytes of cells. ok is false for a
 	// cache the pair does not resolve to, or one with no file. A statement SQLite
 	// refuses is a *QueryError.
-	Query(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, sql string, maxRows, maxBytes int) (ClusterCachedDataQueryResult, bool, error)
+	Query(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, sql string, maxRows, maxBytes int, args ...any) (ClusterCachedDataQueryResult, bool, error)
+	// ReadOwn runs read over one snapshot of the cache, each statement it runs one the
+	// sidecar wrote, on a connection kept between such readings: a reader joining
+	// what several statements answer never joins two states of the cache. ok is false
+	// for a cache the pair does not resolve to, or one with no file; a statement in a
+	// cache gone under the reading answers ErrNoCache. A statement a model wrote goes
+	// through Query.
+	ReadOwn(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, read func(OwnQuery) error) (bool, error)
+	// ReadActive runs read over one reading of cluster id's active cache, whose rows
+	// must be trusted, its statements bounded by maxRows and maxBytes: ErrNoCache for
+	// a cluster with no cache, ErrSyncing for one whose rows are not. Every statement
+	// read runs reads that one cache. read may run twice, as Clusters().ReadActive's
+	// does, so it sets what it returns and never appends to it.
+	ReadActive(ctx context.Context, id ClusterID, maxRows, maxBytes int, read func(CacheReading, ActiveCluster) error) error
 }
 
 // The family accessors are stateless views onto the one *service: the split is
@@ -369,6 +391,8 @@ type deps struct {
 	kubestoreMgr  kubestoreManager
 	kubesyncSvc   kubesyncService
 	pokeSvc       *poke.Service
+	// cacheFiles is the log store as the passes reach it, set by SetCacheFiles.
+	cacheFiles *cacheFiles
 
 	// kindSpecMu serializes the read-modify-write on a ClusterCachedKind spec, which two
 	// writers share: the sync-enabled setter, and the sweep converging a catalog change
@@ -391,6 +415,7 @@ func newDeps(bh *beehive.Beehive, db *appdb.DB, store *sqlstmt.Set[stmtID], kube
 		kubestoreMgr:  kubestoreMgr,
 		kubesyncSvc:   kubesyncSvc,
 		pokeSvc:       pokeSvc,
+		cacheFiles:    &cacheFiles{},
 		kindSpecMu:    &sync.Mutex{},
 	}
 }
@@ -441,9 +466,12 @@ type Paths struct {
 	BeehiveDBFile, KubestoreDir string
 }
 
+func (s *service) SetCacheFiles(owner CacheFileOwner) { s.cacheFiles.set(owner) }
+
 // New builds the cluster boundary over the app's database and its files at
 // paths: it prepares its statements, opens the runtime store, registers the
-// controllers, and leaves everything stopped until Start.
+// controllers, and leaves everything stopped until Start. The log files a cache's clear
+// and removal reach arrive by SetCacheFiles, once the logs service exists.
 func New(db *appdb.DB, paths Paths, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service) (Service, error) {
 	store, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write, db.Read, statements)
 	if err != nil {

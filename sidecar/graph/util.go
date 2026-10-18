@@ -17,6 +17,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/run/kubeproxy"
 	"github.com/kstackhq/kstack/sidecar/internal/run/permissions"
 	"github.com/kstackhq/kstack/sidecar/internal/services/cluster"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
 	"github.com/kstackhq/kstack/sidecar/internal/services/memory"
 	"github.com/kstackhq/kstack/sidecar/internal/services/settings"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/bash"
@@ -161,6 +162,24 @@ func chatErr(err error) error {
 	return err
 }
 
+// logsErr is what both log resolvers return an error through: a refusal in the
+// user's words is a validation error carrying them.
+func logsErr(err error) error {
+	var refusal logs.Refusal
+	var unmirrored logs.Unmirrored
+	var noNodes logs.NoNodes
+	switch {
+	case errors.As(err, &refusal):
+	case errors.As(err, &unmirrored):
+		refusal = unmirrored.Refusal
+	case errors.As(err, &noNodes):
+		refusal = noNodes.Refusal
+	default:
+		return err
+	}
+	return gqlerrors.NewValidationError("logs", refusal.Reason)
+}
+
 // sandboxPathErr is what every sandbox path resolver returns an error
 // through: a refusal in the user's words is a validation error carrying them,
 // and anything else stays opaque.
@@ -194,6 +213,25 @@ func sandboxPathOf(entries []settings.PathEntry) []*model.SandboxPathEntry {
 		}
 	}
 	return out
+}
+
+// snapshotOf is the wire's snapshot as the chat service takes it; nil for none.
+func snapshotOf(in *model.LogsViewSnapshotInput) *chat.Snapshot {
+	if in == nil {
+		return nil
+	}
+	selected := make([]chat.SelectedLine, len(in.Selected))
+	for i, l := range in.Selected {
+		selected[i] = chat.SelectedLine{
+			Timestamp: l.Timestamp, Namespace: l.Namespace, Pod: l.Pod, Container: l.Container,
+			Previous: l.Previous, Message: l.Message,
+		}
+	}
+	return &chat.Snapshot{
+		CallID: in.CallID, From: in.From, To: in.To, Lines: in.Lines,
+		AtEnd: in.AtEnd, PinnedToEnd: in.PinnedToEnd, Paused: in.Paused,
+		Selected: selected, SelectedCount: in.SelectedCount,
+	}
 }
 
 // noSandboxExecutables refuses a probe or a register on a machine with no sandbox.

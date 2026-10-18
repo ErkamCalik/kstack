@@ -324,6 +324,42 @@ func TestWatchObjectsSendsADeletedFrameWithoutABody(t *testing.T) {
 	assert.Empty(t, gone.Object.RawJSON, "a removal carries no body")
 }
 
+// A watch narrowed to namespaces sends only their objects, with no body, and a
+// change elsewhere sends nothing.
+func TestWatchObjectsInSendsOnlyItsNamespaces(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+	podKind := kubestore.Kind{APIVersion: "v1", Kind: "Pod", Resource: "pods"}
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
+		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
+	}, true, 7))
+	elsewhere := func(uid, name, rv string) *unstructured.Unstructured {
+		pod := dataPod(uid, name, rv)
+		pod.SetNamespace("staging")
+		return pod
+	}
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Added, dataPod("uid-1", "api-0", "42")))
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Added, elsewhere("uid-2", "api-0", "43")))
+
+	stream, err := f.data().WatchObjectsIn(ctx, f.clusterID, f.cacheID, "v1", "pods", []string{"prod"})
+	require.NoError(t, err)
+
+	first := testutil.Recv(t, stream.Frames, "the object")
+	require.NotNil(t, first.Object)
+	assert.Equal(t, "uid-1", first.Object.UID)
+	assert.Empty(t, first.Object.RawJSON, "a narrowed watch carries no body")
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Added, elsewhere("uid-3", "api-1", "44")))
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Deleted, elsewhere("uid-2", "api-0", "43")))
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Added, dataPod("uid-4", "api-1", "45")))
+
+	next := testutil.Recv(t, stream.Frames, "the next object in prod")
+	assert.Equal(t, DeltaFrameAdded, next.Type)
+	assert.Equal(t, "uid-4", next.Object.UID)
+}
+
 // A guard on the split's cost: the diff read and the body fetch are two queries against a
 // moving table, so a row can go between them. The frame serves a null body and the watch
 // carries on — the next resync's Deleted frame is the real answer, and failing the stream
@@ -596,6 +632,47 @@ func TestQueryReadsTheCache(t *testing.T) {
 	assert.Equal(t, ClusterCachedDataQueryResult{Columns: []string{"name"}, Rows: [][]any{{"api-0"}}}, got)
 }
 
+// A reading's statements read the cache's views as Query does, their values bound.
+func TestReadOwnReadsTheCache(t *testing.T) {
+	ctx := context.Background()
+	f := newDataFixture(t)
+	require.NoError(t, f.store.ApplyChange(ctx, kubestore.Kind{APIVersion: "v1", Kind: "Pod", Resource: "pods"},
+		watch.Added, dataPod("uid-1", "api-0", "42")))
+	f.stopWorkers()
+
+	var got ClusterCachedDataQueryResult
+	ok, err := f.data().ReadOwn(ctx, f.clusterID, f.cacheID, func(query OwnQuery) error {
+		var err error
+		got, err = query(`SELECT name FROM objects WHERE uid = ?`, 10, 1<<20, "uid-1")
+		return err
+	})
+
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, ClusterCachedDataQueryResult{Columns: []string{"name"}, Rows: [][]any{{"api-0"}}}, got)
+}
+
+// A reading's statement SQLite refuses is a *QueryError, and a reading of a cache of
+// another cluster is not ok.
+func TestReadOwnRefusesWhatQueryRefuses(t *testing.T) {
+	ctx := context.Background()
+	f := newDataFixture(t)
+	f.stopWorkers()
+
+	ok, err := f.data().ReadOwn(ctx, f.clusterID, f.cacheID, func(query OwnQuery) error {
+		_, err := query(`SELECT nope FROM objects`, 10, 1<<20)
+		return err
+	})
+	var qe *QueryError
+	require.ErrorAs(t, err, &qe)
+	assert.True(t, ok)
+
+	other := createCluster(t, f.d, "other")
+	ok, err = f.data().ReadOwn(ctx, clusterIDOf(other), f.cacheID, func(OwnQuery) error { return nil })
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
 func TestQueryOfACacheOfAnotherClusterIsNotOK(t *testing.T) {
 	f := newDataFixture(t)
 	other := createCluster(t, f.d, "other")
@@ -659,4 +736,14 @@ func TestQueryReportsAStoreThatWillNotOpen(t *testing.T) {
 	_, _, err := f.data().Query(context.Background(), f.clusterID, f.cacheID, `SELECT 1`, 10, 1<<20)
 
 	assert.ErrorIs(t, err, boom)
+}
+
+// ReadActive reads the service's own records: a cache that has synced nothing is
+// not trusted, and a cluster that is gone has no cache.
+func TestReadActiveReadsTheServicesCluster(t *testing.T) {
+	f := newDataFixture(t)
+	read := func(CacheReading, ActiveCluster) error { return nil }
+
+	assert.ErrorIs(t, f.data().ReadActive(context.Background(), f.clusterID, 10, 1<<20, read), ErrSyncing)
+	assert.ErrorIs(t, f.data().ReadActive(context.Background(), "404", 10, 1<<20, read), ErrNoCache)
 }

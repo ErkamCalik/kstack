@@ -21,6 +21,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/run/sandbox"
 	"github.com/kstackhq/kstack/sidecar/internal/services/auth"
 	"github.com/kstackhq/kstack/sidecar/internal/services/cluster"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
 	"github.com/kstackhq/kstack/sidecar/internal/services/memory"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/bash"
 )
@@ -186,8 +187,8 @@ func (r *mutationResolver) ClusterCachedKindSyncEnabledSet(ctx context.Context, 
 // ChatSend is the resolver for the chatSend field. The cluster is the chat service's
 // to check, inside the send's transaction, so a send and a cluster delete are
 // serialized where they meet.
-func (r *mutationResolver) ChatSend(ctx context.Context, chatID *apimeta.ChatID, mode chat.Mode, clusterID apimeta.ClusterID, sandboxDisabled bool, networkEnabled bool, networkThisTurn bool, providerID string, modelID string, effort string, requestID string, content string) (*chat.ChatMessage, error) {
-	msg, err := r.ChatSvc.Send(ctx, chatID, mode, clusterID, sandboxDisabled, networkEnabled, networkThisTurn, providerID, modelID, effort, requestID, content)
+func (r *mutationResolver) ChatSend(ctx context.Context, chatID *apimeta.ChatID, mode chat.Mode, clusterID apimeta.ClusterID, sandboxDisabled bool, networkEnabled bool, networkThisTurn bool, providerID string, modelID string, effort string, requestID string, content string, snapshot *model.LogsViewSnapshotInput) (*chat.ChatMessage, error) {
+	msg, err := r.ChatSvc.Send(ctx, chatID, mode, clusterID, sandboxDisabled, networkEnabled, networkThisTurn, providerID, modelID, effort, requestID, content, snapshotOf(snapshot))
 	if err != nil {
 		return nil, chatErr(err)
 	}
@@ -546,6 +547,15 @@ func (r *queryResolver) ChatGrants(ctx context.Context, chatID apimeta.ChatID) (
 	return rulePointers(rules), nil
 }
 
+// LogsFetch is the resolver for the logsFetch field.
+func (r *queryResolver) LogsFetch(ctx context.Context, id apimeta.ClusterID, view logs.View, mode logs.FetchMode, cursor *string, at *time.Time, limit int) (*logs.Page, error) {
+	page, err := r.Logs.Fetch(ctx, id, view, logs.FetchQuery{Mode: mode, Cursor: cursor, At: at, Limit: limit})
+	if err != nil {
+		return nil, logsErr(err)
+	}
+	return &page, nil
+}
+
 // AuthState is the resolver for the authState field. auth.State binds directly to the
 // GraphQL type, so only schema fields are exposed — State.Tokens never reaches the wire.
 func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
@@ -706,6 +716,15 @@ func (r *subscriptionResolver) MemoriesWatch(ctx context.Context, clusterID apim
 	st, err := r.MemorySvc.Watch(ctx, clusterID)
 	if err != nil {
 		return nil, memoryErr(err)
+	}
+	return watchStream(ctx, st.Frames, st.Err), nil
+}
+
+// LogsFollow is the resolver for the logsFollow field.
+func (r *subscriptionResolver) LogsFollow(ctx context.Context, id apimeta.ClusterID, view logs.View, after *string) (<-chan *logs.FollowFrame, error) {
+	st, err := r.Logs.Follow(ctx, id, view, after)
+	if err != nil {
+		return nil, logsErr(err)
 	}
 	return watchStream(ctx, st.Frames, st.Err), nil
 }

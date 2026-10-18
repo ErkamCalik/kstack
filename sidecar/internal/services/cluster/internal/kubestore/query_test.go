@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -113,8 +114,8 @@ func TestEveryViewReads(t *testing.T) {
 			"type", "reason", "message", "first_seen", "last_seen", "count", "body"},
 		"status_history": {"uid", "at", "status"},
 		"kinds":          {"api_version", "api_group", "version", "kind", "resource", "scope", "is_crd", "count"},
-		"containers": {"pod_uid", "name", "init", "position", "sidecar", "image", "image_id", "ready", "restarts",
-			"state", "reason", "exit_code", "last_reason", "last_exit_code",
+		"containers": {"pod_uid", "name", "init", "position", "sidecar", "image", "image_id", "container_id", "ready", "restarts",
+			"state", "reason", "exit_code", "last_reason", "last_exit_code", "last_container_id",
 			"cpu_request", "cpu_limit", "memory_request", "memory_limit"},
 		"selects": {"selector_uid", "uid"},
 		"refs":    {"uid", "path", "to_group", "to_kind", "to_namespace", "to_name", "key", "optional", "to_uid", "to_listed"},
@@ -372,6 +373,20 @@ func TestOnlyAQueryRuns(t *testing.T) {
 	assert.Empty(t, entries)
 }
 
+// A value is bound to its placeholder, never pasted into the statement, so a quote
+// or a semicolon in it is matched as written.
+func TestAValueIsBoundToItsPlaceholder(t *testing.T) {
+	ctx := context.Background()
+	s := populated(t)
+	const odd = `it's; here`
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, owned(podKind, "odd", odd, "")))
+
+	res, err := s.Query(ctx, `SELECT uid, name FROM objects WHERE kind = ? AND name = ?`, 10, 1<<20, "Pod", odd)
+
+	require.NoError(t, err)
+	assert.Equal(t, [][]any{{"odd", odd}}, res.Rows)
+}
+
 func TestATrailingSemicolonRuns(t *testing.T) {
 	t.Parallel()
 
@@ -462,7 +477,7 @@ func queryConnOf(t *testing.T, s *Store) *sql.Conn {
 	t.Helper()
 	f, err := s.file()
 	require.NoError(t, err)
-	conn, err := f.queryConn(context.Background())
+	conn, err := queryConn(context.Background(), f.queryDB)
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
 	return conn
@@ -521,6 +536,69 @@ func TestAQueryConnectionLeavesNothingForTheNext(t *testing.T) {
 
 	assert.Equal(t, [][]any{{"pods"}}, res.Rows)
 	assert.Equal(t, [][]any{{int64(0)}}, left.Rows)
+}
+
+// A reading's statements read the views and bind their values as Query does, on a
+// connection the next reading takes again.
+func TestReadOwnReadsTheViewsOnAKeptConnection(t *testing.T) {
+	s := populated(t)
+	for range 2 {
+		require.NoError(t, s.ReadOwn(context.Background(), func(r Reading) error {
+			res, err := r.Query(`SELECT resource FROM objects WHERE uid = ?`, 100, 1<<20, "pod")
+			require.NoError(t, err)
+			assert.Equal(t, [][]any{{"pods"}}, res.Rows)
+			return nil
+		}))
+	}
+
+	f, err := s.file()
+	require.NoError(t, err)
+	assert.Equal(t, 1, f.ownQueryDB.Stats().OpenConnections)
+	assert.Zero(t, f.queryDB.Stats().OpenConnections)
+}
+
+// A reading's statements see the cache as its first did, whatever commits between
+// them, and the next reading sees the commit.
+func TestAReadingIsOneSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s := populated(t)
+	pods := func(r Reading) [][]any {
+		res, err := r.Query(`SELECT name FROM objects WHERE kind = 'Pod' ORDER BY name`, 100, 1<<20)
+		require.NoError(t, err)
+		return res.Rows
+	}
+
+	require.NoError(t, s.ReadOwn(ctx, func(r Reading) error {
+		before := pods(r)
+		require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, owned(podKind, "pod-2", "api-7d9f-1", "rs")))
+		assert.Equal(t, before, pods(r))
+		return nil
+	}))
+	require.NoError(t, s.ReadOwn(ctx, func(r Reading) error {
+		assert.Equal(t, [][]any{{"api-7d9f-0"}, {"api-7d9f-1"}}, pods(r))
+		return nil
+	}))
+}
+
+// A reading that fails leaves its connection with no transaction open, so the next
+// reading on it sees the cache as it is.
+func TestAFailedReadingEndsItsTransaction(t *testing.T) {
+	ctx := context.Background()
+	s := populated(t)
+	failed := errors.New("failed")
+
+	require.ErrorIs(t, s.ReadOwn(ctx, func(r Reading) error {
+		_, err := r.Query(`SELECT 1`, 10, 1<<20)
+		require.NoError(t, err)
+		return failed
+	}), failed)
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, owned(podKind, "pod-2", "api-7d9f-1", "rs")))
+	require.NoError(t, s.ReadOwn(ctx, func(r Reading) error {
+		res, err := r.Query(`SELECT count(*) FROM objects WHERE kind = 'Pod'`, 10, 1<<20)
+		require.NoError(t, err)
+		assert.Equal(t, [][]any{{int64(2)}}, res.Rows)
+		return nil
+	}))
 }
 
 func TestAValuePastTheLengthLimitFails(t *testing.T) {

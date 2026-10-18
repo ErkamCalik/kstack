@@ -15,13 +15,18 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { LogsViewProvider, useLogsView } from '@/lib/logs-view';
+import type { LogsView } from '@/lib/logs-view';
 import { RightSidebarProvider } from '@/lib/right-sidebar';
 import type { AppMode } from '@/lib/app-mode';
 
-// The panel's contents have a suite of their own, and the real widget wants a router,
-// a urql client and the Tauri bridge. This file is about which one is mounted.
+// The panel's contents have a suite of their own, and the real widgets want a router,
+// a urql client, the Tauri bridge and a layout. This file is about which one is mounted.
 vi.mock('@/components/widgets/dashboard-chat', () => ({
   DashboardChat: () => <div data-testid="dashboard-chat" />,
+}));
+vi.mock('@/components/widgets/log-viewer', () => ({
+  LogViewer: () => <div data-testid="log-viewer" />,
 }));
 
 const { RightSidebar, RightSidebarToggle } = await import('./right-sidebar');
@@ -33,10 +38,39 @@ const { RightSidebar, RightSidebarToggle } = await import('./right-sidebar');
 const renderPanel = ({ mode = 'chat' }: { mode?: AppMode } = {}) =>
   render(
     <RightSidebarProvider mode={mode}>
-      <RightSidebarToggle />
-      <RightSidebar />
+      <LogsViewProvider>
+        <RightSidebarToggle />
+        <RightSidebar />
+        <FocusView />
+      </LogsViewProvider>
     </RightSidebarProvider>,
   );
+
+const logsView: LogsView = {
+  clusterId: 'cluster-1',
+  chatId: 'chat-1',
+  callId: 'call-1',
+  action: {
+    sources: [
+      { namespace: 'prod', kind: 'Deployment', name: 'webapp', containers: [], allContainers: false, previous: false },
+    ],
+    filters: [],
+    grep: '',
+    anchor: { kind: 'Tail', at: null },
+    pinToEnd: true,
+    resolvedAt: '2026-10-08T14:04:00Z',
+  },
+};
+
+// Stands in for whatever sets the focused view: the card's Expand, or the newest call.
+function FocusView() {
+  const { set } = useLogsView();
+  return (
+    <button type="button" onClick={() => set(logsView)}>
+      focus view
+    </button>
+  );
+}
 
 const panel = () => screen.queryByTestId('right-sidebar');
 const panelWidth = () => screen.getByTestId('right-sidebar').style.width;
@@ -91,7 +125,6 @@ describe('RightSidebar', () => {
     clickToggle();
     // Not floating: it takes width from the page and the row's height makes it
     // flush with the bar above and the window's bottom edge.
-    expect(panel()).toHaveClass('shrink-0');
     expect(panel()).not.toHaveClass('absolute', 'fixed', 'rounded-lg');
   });
 
@@ -113,15 +146,31 @@ describe('RightSidebar', () => {
     expect(panelWidth()).toBe('400px');
   });
 
-  it('clamps the dragged width to the min/max bounds', () => {
+  it('clamps the dragged width to 240px and, in chat mode, 1200px for the log viewer’s columns', () => {
     renderPanel();
     clickToggle();
 
     fireEvent.pointerDown(handle(), { pointerId: 1 });
-    fireEvent.pointerMove(window, { clientX: 10 });
-    expect(panelWidth()).toBe('640px');
+    fireEvent.pointerMove(window, { clientX: -500 });
+    expect(panelWidth()).toBe('1200px');
     fireEvent.pointerMove(window, { clientX: 990 });
     expect(panelWidth()).toBe('240px');
+  });
+
+  it('clamps the dashboard’s panel, which holds a transcript, at 640px', () => {
+    renderPanel({ mode: 'dashboard' });
+    clickToggle();
+
+    fireEvent.pointerDown(handle(), { pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: -500 });
+    expect(panelWidth()).toBe('640px');
+  });
+
+  it('gives way to the page on a narrow window, down to its minimum', () => {
+    renderPanel();
+    clickToggle();
+    expect(screen.getByTestId('right-sidebar')).not.toHaveClass('shrink-0');
+    expect(screen.getByTestId('right-sidebar')).toHaveStyle({ minWidth: '240px' });
   });
 
   it('restores the last-saved width on mount (new windows inherit it)', () => {
@@ -149,6 +198,18 @@ describe('RightSidebar', () => {
     renderPanel();
     clickToggle();
     expect(screen.getByRole('complementary', { name: 'Chat details' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Conversation' })).toBeInTheDocument();
+  });
+
+  it('draws the focused log view in chat mode, and the placeholder again once it is closed', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'focus view' }));
+    // Setting the view opens the panel by itself.
+    expect(screen.getByRole('heading', { name: /Logs: Deployment webapp in prod/ })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Conversation' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close log view' }));
+    expect(panel()).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Conversation' })).toBeInTheDocument();
   });
 

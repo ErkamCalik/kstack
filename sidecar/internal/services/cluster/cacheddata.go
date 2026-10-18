@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/kstackhq/kstack/sidecar/internal/lib/rawjson"
@@ -328,6 +329,50 @@ func (a cachedDataAPI) WatchObjects(ctx context.Context, clusterID ClusterID, ca
 	}), nil
 }
 
+func (a cachedDataAPI) WatchObjectsIn(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string, namespaces []string) (*Stream[ClusterCachedDataObjectWatchFrame], error) {
+	bookmark := ClusterCachedDataObjectWatchFrame{
+		Type: DeltaFrameBookmark, CacheID: cacheID, APIVersion: apiVersion, Resource: resource,
+	}
+	live, err := a.gate(ctx, clusterID, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	if !live {
+		return emptyStream(ctx, bookmark), nil
+	}
+	// A row outside the namespaces is never held, so its delete sends nothing either.
+	in := func(rows []kubestore.ObjectRow) []kubestore.ObjectRow {
+		return slices.DeleteFunc(rows, func(r kubestore.ObjectRow) bool { return !slices.Contains(namespaces, r.Namespace) })
+	}
+	return runCachedDataWatch(ctx, cachedDataWatchSpec[kubestore.ObjectRow, ClusterCachedDataObjectWatchFrame]{
+		stores:   a.s.kubestoreMgr,
+		cacheID:  int64(cacheID),
+		busKeys:  []string{kubestore.ObjectsKey(apiVersion, resource)},
+		debounce: dataObjectsDebounce,
+		retry:    dataRetryInterval,
+		key:      func(r kubestore.ObjectRow) string { return r.UID },
+		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.ObjectRow, kubestore.Cursor, error) {
+			rows, at, err := s.ObjectsWithCursor(ctx, apiVersion, resource)
+			return in(rows), at, err
+		},
+		changes: func(ctx context.Context, s *kubestore.Store, since int64) (kubestore.Changes[kubestore.ObjectRow], error) {
+			c, err := s.ObjectChanges(ctx, apiVersion, resource, since)
+			c.Written = in(c.Written)
+			return c, err
+		},
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r kubestore.ObjectRow) ClusterCachedDataObjectWatchFrame {
+			obj := ClusterCachedDataObject{
+				UID: r.UID, APIVersion: r.APIVersion, Kind: r.Kind, Namespace: r.Namespace, Name: r.Name,
+				CreationTimestamp: millisToTime(r.CreatedAt),
+			}
+			return ClusterCachedDataObjectWatchFrame{
+				Type: t, Object: &obj, CacheID: cacheID, APIVersion: apiVersion, Resource: resource,
+			}
+		},
+		bookmark: bookmark,
+	}), nil
+}
+
 func (a cachedDataAPI) WatchEvents(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCachedDataEventWatchFrame], error) {
 	bookmark := ClusterCachedDataEventWatchFrame{Type: DeltaFrameBookmark, CacheID: cacheID}
 	live, err := a.gate(ctx, clusterID, cacheID)
@@ -445,31 +490,79 @@ func millisToTime(ms int64) time.Time {
 	return time.UnixMilli(ms)
 }
 
-func (a cachedDataAPI) Query(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, sql string, maxRows, maxBytes int) (ClusterCachedDataQueryResult, bool, error) {
-	live, err := a.gate(ctx, clusterID, cacheID)
-	if err != nil || !live {
-		return ClusterCachedDataQueryResult{}, false, err
-	}
-	// Claims the file the way ListKinds does: a paused cache holds its rows with nothing
-	// keeping it open.
-	store, ok, err := a.s.kubestoreMgr.OpenExisting(int64(cacheID))
-	switch {
-	case err != nil && !cacheGone(err):
-		return ClusterCachedDataQueryResult{}, false, fmt.Errorf("open cache %d: %w", cacheID, err)
-	case err != nil, !ok:
-		return ClusterCachedDataQueryResult{}, false, nil
+func (a cachedDataAPI) Query(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, sql string, maxRows, maxBytes int, args ...any) (ClusterCachedDataQueryResult, bool, error) {
+	return a.query(ctx, clusterID, cacheID, sql, maxRows, maxBytes, args)
+}
+
+func (a cachedDataAPI) ReadOwn(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, read func(OwnQuery) error) (bool, error) {
+	store, ok, err := a.openQueried(ctx, clusterID, cacheID)
+	if err != nil || !ok {
+		return false, err
 	}
 	defer store.Release()
 
-	res, err := store.Query(ctx, sql, maxRows, maxBytes)
+	err = store.ReadOwn(ctx, func(r kubestore.Reading) error {
+		return read(func(sql string, maxRows, maxBytes int, args ...any) (ClusterCachedDataQueryResult, error) {
+			res, err := r.Query(sql, maxRows, maxBytes, args...)
+			if cacheGone(err) {
+				return ClusterCachedDataQueryResult{}, ErrNoCache
+			}
+			return queryResult(cacheID, res, err)
+		})
+	})
+	if cacheGone(err) {
+		return false, nil
+	}
+	return true, err
+}
+
+// query runs sql over the cache on KubeQuery's pool.
+func (a cachedDataAPI) query(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, sql string, maxRows, maxBytes int, args []any) (ClusterCachedDataQueryResult, bool, error) {
+	store, ok, err := a.openQueried(ctx, clusterID, cacheID)
+	if err != nil || !ok {
+		return ClusterCachedDataQueryResult{}, false, err
+	}
+	defer store.Release()
+
+	res, err := store.Query(ctx, sql, maxRows, maxBytes, args...)
+	if cacheGone(err) {
+		return ClusterCachedDataQueryResult{}, false, nil
+	}
+	out, err := queryResult(cacheID, res, err)
+	return out, err == nil, err
+}
+
+// openQueried claims the file of the cache the pair resolves to, false for one with
+// none. It claims the file the way ListKinds does: a paused cache holds its rows with
+// nothing keeping it open.
+func (a cachedDataAPI) openQueried(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*kubestore.Store, bool, error) {
+	live, err := a.gate(ctx, clusterID, cacheID)
+	if err != nil || !live {
+		return nil, false, err
+	}
+	store, ok, err := a.s.kubestoreMgr.OpenExisting(int64(cacheID))
+	switch {
+	case err != nil && !cacheGone(err):
+		return nil, false, fmt.Errorf("open cache %d: %w", cacheID, err)
+	case err != nil, !ok:
+		return nil, false, nil
+	}
+	return store, true, nil
+}
+
+// queryResult is a statement's answer as CachedData serves it, SQLite's refusal a
+// *QueryError.
+func queryResult(cacheID ClusterCacheID, res kubestore.QueryResult, err error) (ClusterCachedDataQueryResult, error) {
 	var qe *kubestore.QueryError
 	switch {
 	case errors.As(err, &qe):
-		return ClusterCachedDataQueryResult{}, false, &QueryError{Message: qe.Message}
-	case cacheGone(err):
-		return ClusterCachedDataQueryResult{}, false, nil
+		return ClusterCachedDataQueryResult{}, &QueryError{Message: qe.Message}
 	case err != nil:
-		return ClusterCachedDataQueryResult{}, false, fmt.Errorf("query cache %d: %w", cacheID, err)
+		return ClusterCachedDataQueryResult{}, fmt.Errorf("query cache %d: %w", cacheID, err)
 	}
-	return ClusterCachedDataQueryResult{Columns: res.Columns, Rows: res.Rows, More: res.More}, true, nil
+	return ClusterCachedDataQueryResult{Columns: res.Columns, Rows: res.Rows, More: res.More}, nil
+}
+
+func (a cachedDataAPI) ReadActive(ctx context.Context, id ClusterID, maxRows, maxBytes int, read func(CacheReading, ActiveCluster) error) error {
+	return ReadActiveCache(ctx, a.s, id, maxRows, maxBytes, read)
 }

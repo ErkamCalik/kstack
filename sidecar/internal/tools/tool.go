@@ -32,6 +32,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
 	"github.com/kstackhq/kstack/sidecar/internal/run/permissions"
 	"github.com/kstackhq/kstack/sidecar/internal/run/session"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
 )
 
 const (
@@ -151,6 +152,15 @@ type ApprovedRunner interface {
 	RunApproved(ctx context.Context, rt Runtime, input json.RawMessage, a Approval) (text string, isError bool)
 }
 
+// Shown is a Runner whose run resolves what the call showed, which the row keeps
+// as the call's action: read off the arguments alone it would say what the model
+// typed, not what the mirror and the clock made of it. shown is nil on a refusal,
+// and Run on such a tool is RunShown with the action dropped.
+type Shown interface {
+	Runner
+	RunShown(ctx context.Context, rt Runtime, input json.RawMessage) (text string, isError bool, shown *Action)
+}
+
 // Refusal is an Approval error carrying the result the model reads, so a call
 // refused before the user is asked says why in the tool's own words.
 type Refusal struct {
@@ -174,10 +184,13 @@ const (
 	ActionMemory    ActionKind = "memory"
 	ActionDelegate  ActionKind = "delegate"   // hands a task to a subagent
 	ActionKubeQuery ActionKind = "kube-query" // SQL over the cluster's cache
+	ActionLogsView  ActionKind = "logs-view"  // a live view of logs the user looks at
+	ActionLogsRead  ActionKind = "logs-read"  // log lines the model read
+	ActionLogsWatch ActionKind = "logs-watch" // a follow of logs that wakes the model when it ends
 )
 
 // ActionKinds is every kind, in declaration order.
-var ActionKinds = []ActionKind{ActionCommand, ActionRead, ActionWrite, ActionEdit, ActionSearch, ActionFetch, ActionStop, ActionMemory, ActionDelegate, ActionKubeQuery}
+var ActionKinds = []ActionKind{ActionCommand, ActionRead, ActionWrite, ActionEdit, ActionSearch, ActionFetch, ActionStop, ActionMemory, ActionDelegate, ActionKubeQuery, ActionLogsView, ActionLogsRead, ActionLogsWatch}
 
 // valid reports whether k is one of ActionKinds.
 func (k ActionKind) valid() bool {
@@ -198,6 +211,9 @@ type Action struct {
 	Memory      *MemoryAction    `json:"memory"`
 	Delegate    *DelegateAction  `json:"delegate"`
 	KubeQuery   *KubeQueryAction `json:"kubeQuery"`
+	LogsView    *LogsViewAction  `json:"logsView"`
+	LogsRead    *LogsReadAction  `json:"logsRead"`
+	LogsWatch   *LogsWatchAction `json:"logsWatch"`
 }
 
 // Kind is the kind whose field is set, or "" for none.
@@ -221,6 +237,12 @@ func (a Action) Kind() ActionKind {
 		return ActionDelegate
 	case a.KubeQuery != nil:
 		return ActionKubeQuery
+	case a.LogsView != nil:
+		return ActionLogsView
+	case a.LogsRead != nil:
+		return ActionLogsRead
+	case a.LogsWatch != nil:
+		return ActionLogsWatch
 	}
 	return ""
 }
@@ -291,6 +313,128 @@ type KubeQueryAction struct {
 	Limit int    `json:"limit"`
 }
 
+// LogsViewAction is a live view of logs the user looks at: the LogsViewInput the
+// log backend reads, then the Anchor the view opens at and PinToEnd, whether the
+// viewer keeps the end in view as lines arrive. Those two are the viewer's, so the
+// backend never sees them. ResolvedAt is when the tool resolved it, on its clock:
+// the moment a view that no longer runs shows its lines up to.
+type LogsViewAction struct {
+	LogsViewInput
+	Anchor     LogsViewAnchor `json:"anchor"`
+	PinToEnd   bool           `json:"pinToEnd"`
+	ResolvedAt time.Time      `json:"resolvedAt"`
+}
+
+// LogsViewAnchor is where a view opens: an edge of the stream, or the moment At,
+// which is set for LogsAnchorAt alone.
+type LogsViewAnchor struct {
+	Kind LogsAnchorKind `json:"kind"`
+	At   *time.Time     `json:"at"`
+}
+
+// LogsAnchorKind is the oldest line the backend keeps, the newest, or a moment
+// between. The GraphQL LogsViewAnchorKind enum binds member by member onto it.
+type LogsAnchorKind string
+
+const (
+	LogsAnchorHead LogsAnchorKind = "head"
+	LogsAnchorTail LogsAnchorKind = "tail"
+	LogsAnchorAt   LogsAnchorKind = "at"
+)
+
+// LogsReadAction is log lines the model read: the LogsViewInput it read, the
+// range's ends as moments, nil for an open end, the Mode the sample came from, and
+// ResolvedAt, when the tool resolved it on its clock. Lines is what the model read,
+// oldest first, stripped, redacted and cut; Dropped the lines its budget left out;
+// Before and After what lies past each end; Skipped each stream it could not read,
+// one line each. ViewAround is the view View around this opens, nil with no line.
+// Every string but the view's is cluster text.
+type LogsReadAction struct {
+	LogsViewInput
+	Since      *time.Time      `json:"since"`
+	Until      *time.Time      `json:"until"`
+	Mode       LogsReadMode    `json:"mode"`
+	ResolvedAt time.Time       `json:"resolvedAt"`
+	Lines      []LogsReadLine  `json:"lines"`
+	Dropped    int             `json:"dropped"`
+	Before     LogsReadEdge    `json:"before"`
+	After      LogsReadEdge    `json:"after"`
+	Skipped    []string        `json:"skipped"`
+	ViewAround *LogsViewAction `json:"viewAround"`
+}
+
+// LogsWatchAction is what a watch follows: the LogsViewInput it watches, and its
+// bounds, resolved on the tool's clock. Since is where the window starts, the
+// call's own or ResolvedAt; Limit and MaxBytes are how many matching lines, and how
+// many bytes of them, end it; Until is when it ends on time alone.
+type LogsWatchAction struct {
+	LogsViewInput
+	Since      time.Time `json:"since"`
+	Limit      int       `json:"limit"`
+	MaxBytes   int       `json:"maxBytes"`
+	ResolvedAt time.Time `json:"resolvedAt"`
+	Until      time.Time `json:"until"`
+}
+
+// LogsReadMode is which end of its range a read's sample came from. The GraphQL
+// LogsReadMode enum binds member by member onto it.
+type LogsReadMode string
+
+const (
+	LogsReadHead LogsReadMode = "head"
+	LogsReadTail LogsReadMode = "tail"
+)
+
+// LogsReadEdge is what lies past one end of a sample: nothing, lines the read did
+// not return, or lines there may be past a moment the read stopped at. The GraphQL
+// LogsReadEdge enum binds member by member onto it.
+type LogsReadEdge string
+
+const (
+	LogsReadEnd    LogsReadEdge = "end"
+	LogsReadMore   LogsReadEdge = "more"
+	LogsReadUnread LogsReadEdge = "unread"
+)
+
+// LogsReadLine is one line of a sample, as the model read it, and the hole before
+// it, nil with none.
+type LogsReadLine struct {
+	Timestamp time.Time `json:"timestamp"`
+	Namespace string    `json:"namespace"`
+	Pod       string    `json:"pod"`
+	Container string    `json:"container"`
+	Previous  bool      `json:"previous"`
+	Message   string    `json:"message"`
+	Gap       *LogsGap  `json:"gap"`
+}
+
+// The view's backend half is the log service's vocabulary, named here as the tool
+// spells it.
+type (
+	LogsViewInput   = logs.View
+	LogsViewSource  = logs.ViewSource
+	LogsSourceKind  = logs.SourceKind
+	LogsViewFilter  = logs.ViewFilter
+	LogsFilterField = logs.FilterField
+	LogsGap         = logs.Gap
+)
+
+const (
+	LogsSourcePod         = logs.SourcePod
+	LogsSourceDeployment  = logs.SourceDeployment
+	LogsSourceStatefulSet = logs.SourceStatefulSet
+	LogsSourceDaemonSet   = logs.SourceDaemonSet
+	LogsSourceJob         = logs.SourceJob
+	LogsSourceCronJob     = logs.SourceCronJob
+	LogsSourceReplicaSet  = logs.SourceReplicaSet
+
+	LogsFilterNode   = logs.FilterNode
+	LogsFilterRegion = logs.FilterRegion
+	LogsFilterZone   = logs.FilterZone
+	LogsFilterOS     = logs.FilterOS
+	LogsFilterArch   = logs.FilterArch
+)
+
 // DelegateAction is a task handed to a subagent: Prompt, the brief the parent
 // wrote; AgentType, the kind of agent; Model, the model it runs on, empty for
 // the parent's.
@@ -339,14 +483,14 @@ var (
 )
 
 // StartRefusal is what the model reads when a task could not start: a limit in
-// words it can act on, naming commands and agents since they share the slots,
-// or the start's own error.
+// words it can act on, naming commands, agents and watches since they share the
+// slots, or the start's own error.
 func StartRefusal(err error) string {
 	switch {
 	case errors.Is(err, ErrChatTaskLimit):
-		return "At most 4 background commands and agents run at once in a chat. Wait for a notification, or stop one with TaskStop."
+		return "At most 4 background commands, agents and watches run at once in a chat. Wait for a notification, or stop one with TaskStop."
 	case errors.Is(err, ErrTaskLimit):
-		return "At most 16 background commands and agents run at once in Kstack. Wait for one to finish."
+		return "At most 16 background commands, agents and watches run at once in Kstack. Wait for one to finish."
 	}
 	return "could not start: " + safe.String(err.Error())
 }
@@ -372,6 +516,56 @@ type Exit struct {
 	Code    int
 	OK      bool
 	Stopped bool
+}
+
+// Watches is a chat's log watches.
+type Watches interface {
+	// Start holds w as a background task of the call now running, and answers the
+	// task's id, or ErrChatTaskLimit, ErrTaskLimit, or why it could not start. w is
+	// the chat's from here: the chat calls its Wait once, and Stop on any stop.
+	Start(w Watch) (id string, err error)
+}
+
+// Watch is a follow of logs a tool opened, which the chat holds as a task until
+// it ends.
+type Watch interface {
+	// Wait reads the follow until the watch ends: full, past its deadline, ended
+	// by the follow, or stopped. It returns once the follow is let go.
+	Wait()
+	// Stop ends the follow. Safe to call more than once, and after Wait.
+	Stop()
+	// End is how the watch ended, once Wait has returned; stoppedBy is who
+	// stopped it, the chat's word, "" for none.
+	End(stoppedBy string) WatchEnd
+}
+
+// WatchEnd is how a watch ended, and what it saw.
+type WatchEnd struct {
+	Status WatchStatus
+	Result WatchResult
+}
+
+// WatchStatus is how a watch ended: holding lines, at its time with none, on an
+// error or an end of the follow's with none, or stopped.
+type WatchStatus string
+
+const (
+	WatchMatched WatchStatus = "matched"
+	WatchExpired WatchStatus = "expired"
+	WatchFailed  WatchStatus = "failed"
+	WatchStopped WatchStatus = "stopped"
+)
+
+// WatchResult is a finished watch as its task's row keeps it: Text, what the
+// model reads, a sample whose header names the window, why it ended and the
+// cursors to read around; Lines, the lines it held as the model read them;
+// EndedBecause, why it ended, in the header's words; ViewAround, the view View
+// around this opens, nil with no line.
+type WatchResult struct {
+	Text         string          `json:"text"`
+	Lines        []LogsReadLine  `json:"lines"`
+	EndedBecause string          `json:"endedBecause"`
+	ViewAround   *LogsViewAction `json:"viewAround"`
 }
 
 // Stamp is what a turn last saw of a file: the SHA-256 of its bytes, and
@@ -459,8 +653,9 @@ type ActionAsker interface {
 // field it has; a test sets the ones its tool reads. ClusterID is the chat's stored
 // cluster, the one a tool acting on a cluster reaches, and ChatID the chat; a model
 // names neither. Session is the run's policy, the chat's switch as its turn read
-// it included. Agent is nil in a subagent's runtime, so a subagent spawns
-// nothing. ActionAsker is nil where nobody can be asked.
+// it included. Agent and Watches are nil in a subagent's and a monitor's runtime,
+// so neither spawns an agent or starts a watch. ActionAsker is nil where nobody can
+// be asked.
 type Runtime struct {
 	ClusterID   apimeta.ClusterID
 	ChatID      apimeta.ChatID
@@ -469,5 +664,6 @@ type Runtime struct {
 	Tasks       Tasks
 	Files       FileStamps
 	Agent       Spawner
+	Watches     Watches
 	ActionAsker ActionAsker
 }

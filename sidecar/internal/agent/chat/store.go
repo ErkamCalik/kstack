@@ -350,7 +350,10 @@ type toolCallEntry struct {
 	// Sandboxed is whether a sandbox confined the call, set at the gate.
 	Sandboxed bool
 	// Network is the network the call ran with, set when it starts running.
-	Network    session.Network
+	Network session.Network
+	// Shown is what the run showed, for a tools.Shown tool; nil where the action
+	// is read off Arguments.
+	Shown      *tools.Action
 	Result     string
 	Error      string
 	Status     string
@@ -381,6 +384,8 @@ type taskState struct {
 	Status   string
 	ExitCode sql.NullInt64
 	Report   string
+	// Result is a finished watch's tools.WatchResult as JSON, "" otherwise.
+	Result string
 }
 
 // approval is an approvals row as the turn holds it. It is set to what landed,
@@ -521,6 +526,41 @@ func answerByRequestKey(ctx context.Context, st stmts, requestKey string, box to
 	return msgs[0], true, nil
 }
 
+// viewCall is the call id of chatID whose view the user has open: the id its
+// tool_use block carries and the view, a LogsView call's own, or the View around
+// this of a LogsRead call or a finished LogsWatch call's task. ok is false for a
+// call of another chat, of another tool, or one that showed no view. A subagent's
+// call is the chat's: its run carries the chat's id.
+func viewCall(ctx context.Context, st stmts, chatID ChatID, id ToolCallID) (toolUseID string, view tools.LogsViewAction, ok bool, err error) {
+	var shown, result sql.NullString
+	err = st.QueryRow(ctx, stmtSelectViewCall, string(id), string(chatID)).Scan(&toolUseID, &shown, &result)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !shown.Valid {
+		return "", view, false, nil
+	}
+	if err != nil {
+		return "", view, false, fmt.Errorf("view call: %w", err)
+	}
+	var action tools.Action
+	if err := json.Unmarshal([]byte(shown.String), &action); err != nil {
+		return "", view, false, fmt.Errorf("view call: %w", err)
+	}
+	switch {
+	case action.LogsView != nil:
+		return toolUseID, *action.LogsView, true, nil
+	case action.LogsRead != nil && action.LogsRead.ViewAround != nil:
+		return toolUseID, *action.LogsRead.ViewAround, true, nil
+	case action.LogsWatch != nil && result.Valid:
+		r, err := watchResultOf(result.String)
+		if err != nil {
+			return "", view, false, fmt.Errorf("view call: %w", err)
+		}
+		if r.ViewAround != nil {
+			return toolUseID, *r.ViewAround, true, nil
+		}
+	}
+	return "", view, false, nil
+}
+
 // newestContext is the context the model currently holds for the chat: the text
 // of the newest context block among its questions, or "" when it holds none.
 func newestContext(ctx context.Context, st stmts, id ChatID) (string, error) {
@@ -569,10 +609,18 @@ func upsertToolCall(ctx context.Context, st stmts, c toolCallEntry) error {
 	if c.ByProvider {
 		runsOn = runsOnProvider
 	}
+	var shown sql.NullString
+	if c.Shown != nil {
+		b, err := json.Marshal(c.Shown)
+		if err != nil {
+			return fmt.Errorf("upsert tool call: %w", err)
+		}
+		shown = nullString(string(b))
+	}
 	_, err := st.Exec(ctx, stmtUpsertToolCall,
 		string(c.ID), string(c.LLMCallID), c.Seq, runsOn, c.Name, nullString(c.Contract), nullString(c.ToolUseID), nullString(c.Arguments), c.Cwd, c.Sandboxed,
 		nullString(string(c.Network)), nullString(c.Result), nullString(c.Error), c.IsMutating, nullString(string(c.SpawnedRunID)), nullString(c.Status),
-		millis(c.CreatedAt), c.StartedAt, c.FinishedAt)
+		millis(c.CreatedAt), c.StartedAt, c.FinishedAt, shown)
 	if err != nil {
 		return fmt.Errorf("upsert tool call: %w", err)
 	}
@@ -635,11 +683,18 @@ func toolCallsByRun(ctx context.Context, st stmts, reads callReads, arg string) 
 			approvalDuration             string
 			taskStatus, report           sql.NullString
 			exitCode                     sql.NullInt64
+			shown, watched               sql.NullString
 		)
 		err := rows.Scan(&run, &c.ID, &runsOn, &useID, &c.Name, &contract, &args, &c.Cwd, &c.Sandboxed, &network, &result, &errText, &status, &c.StartedAt,
-			&spawned, &approvalID, &approvalStatus, &approvalDuration, &taskStatus, &exitCode, &report)
+			&spawned, &approvalID, &approvalStatus, &approvalDuration, &taskStatus, &exitCode, &report, &shown, &watched)
 		if err != nil {
 			return nil, fmt.Errorf("tool calls: %w", err)
+		}
+		if shown.Valid {
+			c.Shown = &tools.Action{}
+			if err := json.Unmarshal([]byte(shown.String), c.Shown); err != nil {
+				return nil, fmt.Errorf("tool calls: %w", err)
+			}
 		}
 		c.ByProvider, c.Contract, c.Status = runsOn == runsOnProvider, contract.String, status.String
 		c.ToolUseID, c.Arguments, c.Result, c.Error = useID.String, args.String, result.String, errText.String
@@ -651,7 +706,7 @@ func toolCallsByRun(ctx context.Context, st stmts, reads callReads, arg string) 
 			}
 		}
 		if taskStatus.Valid {
-			c.Task = &taskState{Status: taskStatus.String, ExitCode: exitCode, Report: report.String}
+			c.Task = &taskState{Status: taskStatus.String, ExitCode: exitCode, Report: report.String, Result: watched.String}
 		}
 		c.ClusterWrites = writes[c.ID]
 		out[run] = append(out[run], c)
@@ -729,9 +784,13 @@ const (
 	taskExited  = "exited"
 	taskStopped = "stopped"
 	taskLost    = "lost"
-	// An agent's alone: it answered, or ended on its own error.
+	// An agent's: it answered, or ended on its own error. A watch fails too, on an
+	// error or the follow's end with no line.
 	taskCompleted = "completed"
 	taskFailed    = "failed"
+	// A watch's alone: it ended holding lines, or at its time with none.
+	taskMatched = "matched"
+	taskExpired = "expired"
 )
 
 // Who stopped a task: the model's TaskStop, the user (the Stop button, or the
@@ -752,6 +811,8 @@ type taskEnd struct {
 	ExitCode  sql.NullInt64
 	At        time.Time
 	Notified  bool
+	// Result is a watch's tools.WatchResult as JSON; NULL for every other task.
+	Result sql.NullString
 	// Run ends an agent's run beside the task's row, and Rows writes the run's
 	// rows whole again; both nil for a command's.
 	Run  func(context.Context, stmts) error
@@ -777,7 +838,7 @@ func finishTask(ctx context.Context, st stmts, id TaskID, end taskEnd) error {
 	if end.Notified {
 		notified = nullMillis(end.At)
 	}
-	_, err := st.Exec(ctx, stmtFinishTask, end.Status, nullString(end.StoppedBy), end.ExitCode, millis(end.At), notified, string(id))
+	_, err := st.Exec(ctx, stmtFinishTask, end.Status, nullString(end.StoppedBy), end.ExitCode, millis(end.At), notified, end.Result, string(id))
 	if err != nil {
 		return fmt.Errorf("finish task: %w", err)
 	}
@@ -785,8 +846,9 @@ func finishTask(ctx context.Context, st stmts, id TaskID, end taskEnd) error {
 }
 
 // waitingNotices is the chat's finished tasks whose notices have not reached the
-// model, in the order they ended, each call's action read through box: its
-// command, or, for an Agent call, the report or error of the run it started.
+// model, in the order they ended, each call's action read through box, or the one
+// its run showed: its command, or, for an Agent call, the report or error of the
+// run it started, and for a LogsWatch call, the watch's result.
 func waitingNotices(ctx context.Context, st stmts, chatID ChatID, box tools.Box) ([]waitingNotice, error) {
 	rows, err := st.Query(ctx, stmtSelectWaitingNotices, string(chatID))
 	if err != nil {
@@ -800,18 +862,29 @@ func waitingNotices(ctx context.Context, st stmts, chatID ChatID, box tools.Box)
 			useID, stoppedBy, args sql.NullString
 			agentName, agentArgs   sql.NullString
 			report, runError       sql.NullString
+			shown, result          sql.NullString
 			name, cwd              string
 			exitCode               sql.NullInt64
 			sandboxed, underSend   bool
 		)
 		err := rows.Scan(&w.id, &useID, &w.path, &w.status, &stoppedBy, &exitCode, &name, &args, &cwd, &sandboxed, &agentName, &agentArgs,
-			&w.agent, &report, &runError, &underSend)
+			&w.agent, &report, &runError, &underSend, &shown, &result)
 		if err != nil {
 			return nil, fmt.Errorf("waiting notices: %w", err)
 		}
 		w.toolUseID, w.stoppedBy = useID.String, stoppedBy.String
-		w.report, w.runError, w.underSend = report.String, runError.String, underSend
-		if a := actionOf(box, toolCallEntry{Name: name, Arguments: args.String, Cwd: cwd, Sandboxed: sandboxed}); a != nil {
+		w.report, w.runError, w.underSend, w.result = report.String, runError.String, underSend, result.String
+		kind, _ := box.ActionKind(name)
+		w.watch = kind == tools.ActionLogsWatch
+		call := toolCallEntry{Name: name, Arguments: args.String, Cwd: cwd, Sandboxed: sandboxed}
+		// A watch's description is its run's; every other call reads its own arguments.
+		if w.watch && shown.Valid {
+			call.Shown = &tools.Action{}
+			if err := json.Unmarshal([]byte(shown.String), call.Shown); err != nil {
+				return nil, fmt.Errorf("waiting notices: %w", err)
+			}
+		}
+		if a := actionOf(box, call); a != nil {
 			w.description = a.Description
 			if a.Command != nil {
 				w.command = a.Command.Text

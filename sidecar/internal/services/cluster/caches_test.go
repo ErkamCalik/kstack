@@ -19,6 +19,7 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -463,6 +464,43 @@ func TestCacheReconcileDeletesTheStoreForADyingCache(t *testing.T) {
 	reconcileCache(t, d, obj)
 
 	assert.Equal(t, []int64{int64(cache.ID)}, kubestoreFake(d).removed)
+}
+
+// The log file goes with the cache, in the same pass as the mirror's and after it.
+func TestCacheReconcileRemovesTheLogFileAfterTheMirrors(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, cluster, "uid-1")
+	var order []string
+	kubestoreFake(d).onRemove = func(int64) { order = append(order, "mirror") }
+	files := &fakeCacheFiles{onRemove: func(int64) { order = append(order, "logs") }}
+	d.cacheFiles.set(files)
+	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
+
+	obj, err := d.cacheClient.Get(context.Background(), cache.ID)
+	require.NoError(t, err)
+	reconcileCache(t, d, obj)
+
+	assert.Equal(t, []string{"mirror", "logs"}, order)
+	assert.Equal(t, []int64{int64(cache.ID)}, files.removed)
+}
+
+// A log file that will not go fails the pass as the mirror's does, with the finalizer
+// intact, so the pass runs again rather than leaving a file nothing names any more.
+func TestCacheReconcileKeepsTheFinalizerWhenTheLogFileWillNotGo(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, cluster, "uid-1")
+	d.cacheFiles.set(&fakeCacheFiles{err: assert.AnError})
+	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
+	obj, err := d.cacheClient.Get(context.Background(), cache.ID)
+	require.NoError(t, err)
+	client := &cacheControllerClient{}
+
+	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, obj)
+
+	assert.NotEqual(t, beehive.Settled(), res)
+	assert.Empty(t, client.finalizersCleared, "the finalizer holds the row for the retry")
 }
 
 func TestCacheReconcileLeavesTheStoreAloneForALiveCache(t *testing.T) {
@@ -1171,6 +1209,44 @@ func TestCachesClearRunsInsideTheSyncsHold(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, heldAtClear, "the cache's workers are stopped across the swap")
+}
+
+// The user's clear throws the cache's lines away too, since logs hold secrets more often
+// than object bodies do. The log file needs no sync stopped, so its clear runs before the
+// hold the mirror's runs in.
+func TestCachesClearClearsTheLogFileFirstOutsideTheSyncsHold(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, cluster, "uid-1")
+	var order []string
+	kubestoreFake(d).onClear = func(int64) { order = append(order, "mirror") }
+	heldAtClear := true
+	files := &fakeCacheFiles{onClear: func(int64) {
+		order = append(order, "logs")
+		heldAtClear = syncFake(d).inHold()
+	}}
+	d.cacheFiles.set(files)
+
+	_, err := serviceOver(t, d).Caches().Clear(context.Background(), ClusterCacheID(cache.ID))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"logs", "mirror"}, order)
+	assert.Equal(t, []int64{int64(cache.ID)}, files.cleared)
+	assert.False(t, heldAtClear, "the log file clears outside the sync's hold")
+}
+
+// A log file that will not clear fails the mutation before the mirror is touched, so the
+// error is the whole truth and the user runs it again.
+func TestCachesClearReportsALogFileThatWillNotClear(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d, "prod")
+	cache := createCache(t, d.cacheClient, cluster, "uid-1")
+	d.cacheFiles.set(&fakeCacheFiles{err: assert.AnError})
+
+	_, err := serviceOver(t, d).Caches().Clear(context.Background(), ClusterCacheID(cache.ID))
+
+	assert.ErrorIs(t, err, assert.AnError)
+	assert.Empty(t, kubestoreFake(d).clearedCaches, "the mirror is left as it was")
 }
 
 // --- the health fold ---
@@ -1953,10 +2029,11 @@ func TestCachesWatchHealthSaysNothingWhileTheVerdictHoldsStill(t *testing.T) {
 
 // The three gauges stop where they stand when the consumer goes: every send is checked,
 // so a dropped subscription ends the loop rather than parking it on a channel forever.
-// Each is driven until it is parked on a send — Frames buffers one, and nothing reads it —
-// so the cancellation is the only thing that can free it.
+// Each is driven to a send that parks — Frames buffers one, and nothing reads it — so the
+// cancellation is the only thing that can free it.
 func TestTheCacheGaugesStopForAConsumerThatIsGone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	d, cacheID := syncingCacheWithKinds(t)
 	cluster := ownerClusterObjectOf(t, d, cacheID)
 	clusterID := clusterIDOf(cluster)
@@ -1968,6 +2045,32 @@ func TestTheCacheGaugesStopForAConsumerThatIsGone(t *testing.T) {
 	svc := serviceOver(t, d)
 	svc.gaugeCadence = time.Millisecond
 
+	// The two per-cache gauges re-send only what moved, so their readings move on every
+	// read. A gauge reads a second time only once its first frame fills the buffer, and
+	// that second reading differs, so its next send parks.
+	var statsReads, statusReads atomic.Int64
+	statsParks, statusParks := testutil.NewSignal(), testutil.NewSignal()
+	store.onStats = func(id int64) {
+		if id != int64(cacheID) {
+			return
+		}
+		n := statsReads.Add(1)
+		store.setStats(kubestore.Stats{Exists: true, DBBytes: n})
+		if n == 2 {
+			statsParks.Fire()
+		}
+	}
+	sync.onDiscoveryRead = func(id int64) {
+		if id != int64(cacheID) {
+			return
+		}
+		n := statusReads.Add(1)
+		sync.setDiscoveryState(id, kubesync.DiscoveryState{Reason: kubesync.ReasonDiscovered, Message: strconv.FormatInt(n, 10)})
+		if n == 2 {
+			statusParks.Fire()
+		}
+	}
+
 	health, err := svc.Caches().WatchHealth(ctx)
 	require.NoError(t, err)
 	status, err := svc.Caches().WatchSyncStatus(ctx, clusterID, cacheID)
@@ -1975,26 +2078,17 @@ func TestTheCacheGaugesStopForAConsumerThatIsGone(t *testing.T) {
 	stats, err := svc.Caches().WatchStats(ctx, clusterID, cacheID)
 	require.NoError(t, err)
 
-	// The two per-cache gauges re-send only what moved, so each needs a reading that keeps
-	// moving to fill its buffer and then park on the next send.
-	go func() {
-		for i := int64(1); ctx.Err() == nil; i++ {
-			store.setStats(kubestore.Stats{Exists: true, DBBytes: i})
-			sync.setDiscoveryState(int64(cacheID), kubesync.DiscoveryState{
-				Reason: kubesync.ReasonDiscovered, Message: strconv.FormatInt(i, 10),
-			})
-			time.Sleep(time.Millisecond)
-		}
-	}()
-	require.Eventually(t, func() bool {
-		return len(health.Frames) == 1 && len(status.Frames) == 1 && len(stats.Frames) == 1
-	}, 5*time.Second, time.Millisecond, "each gauge to park on a send")
+	statsParks.Wait(t, "the stats gauge to read again past its first frame")
+	statusParks.Wait(t, "the sync-status gauge to read again past its first frame")
+	// Two caches, so the health gauge's first pass sends twice: the second parks.
+	require.Eventually(t, func() bool { return len(health.Frames) == 1 }, testutil.Timeout, time.Millisecond, "the health gauge to send its first frame")
 
 	cancel()
 
-	testutil.WaitClosed(t, health.Frames, "the health gauge to stop")
-	testutil.WaitClosed(t, status.Frames, "the sync-status gauge to stop")
-	testutil.WaitClosed(t, stats.Frames, "the stats gauge to stop")
+	// Nothing reads Frames, so only the cancellation can free a parked send.
+	testutil.Wait(t, health.done, "the health gauge to stop")
+	testutil.Wait(t, status.done, "the sync-status gauge to stop")
+	testutil.Wait(t, stats.done, "the stats gauge to stop")
 }
 
 // ownerClusterOf is the cluster a cache hangs off, which the per-cache gauges are scoped by.

@@ -32,7 +32,11 @@ import { AppLogo } from '@/components/widgets/app-logo';
 import { DiffBlock } from '@/components/widgets/diff-block';
 import { FolderGrantForm } from '@/components/widgets/folder-grant-form';
 import { approvalAnchor } from '@/lib/approval-anchor';
+import { LogsReadCard } from '@/components/widgets/logs-read-card';
+import { LogsViewCard } from '@/components/widgets/logs-view-card';
+import { LogsWatchCard } from '@/components/widgets/logs-watch-card';
 import { Markdown } from '@/components/widgets/markdown';
+import { ModelDescription } from '@/components/widgets/model-description';
 import { VisibleText } from '@/components/widgets/visible-text';
 import { graphql } from '@/gql';
 import type { AppMode } from '@/lib/app-mode';
@@ -135,14 +139,18 @@ function Thinking({ summary, stillThinking }: { summary: string; stillThinking: 
   );
 }
 
-// The context a question carries — the cluster card, then the memory notes —
-// closed: it is there so the user can see what the provider was told, at the
-// message it rode. Plain text, never markdown — its names came from the cluster.
+// The context a question carries — the cluster card, the memory notes, the
+// workspace, the view and the sandbox — closed: it is there so the user can see
+// what the provider was told, at the message it rode, escapes and all. Plain text,
+// never markdown, with every invisible or reordering character spelled: its names
+// and selected lines came from the cluster.
 function ClusterContext({ card }: { card: string }) {
   return (
     <details className="mb-2">
       <summary className="cursor-pointer text-xs text-muted-foreground select-none">Context</summary>
-      <div className="mt-1 border-l-2 border-muted pl-3 text-xs whitespace-pre-wrap text-muted-foreground">{card}</div>
+      <div className="mt-1 border-l-2 border-muted pl-3 text-xs whitespace-pre-wrap text-muted-foreground">
+        <VisibleText text={card} />
+      </div>
     </details>
   );
 }
@@ -222,8 +230,8 @@ function toolCallTag(call: ChatToolCall): string {
   }
 }
 
-// The tag of a call that started a background task, a command or an agent:
-// where the task is, off its own row, since the call itself answered at once.
+// The tag of a call that started a background task, a command, an agent or a
+// watch: where the task is, off its own row, since the call itself answered at once.
 function backgroundTag(task: NonNullable<ChatToolCall['background']>): string {
   switch (task.status) {
     case 'Running':
@@ -234,6 +242,10 @@ function backgroundTag(task: NonNullable<ChatToolCall['background']>): string {
       return 'completed';
     case 'Failed':
       return 'failed';
+    case 'Matched':
+      return 'matched';
+    case 'Expired':
+      return 'expired';
     case 'Stopped':
       return 'stopped';
     default:
@@ -491,15 +503,64 @@ function ToolCalls({
   byAgent,
   modelLabel,
   chatID,
+  clusterID,
+  mode,
+  ends,
 }: {
   calls: ChatToolCall[];
   byAgent: SubagentCalls;
   modelLabel: ModelLabel;
   chatID: string;
+  clusterID: string | undefined;
+  mode: AppMode;
+  ends: ViewEnds;
 }) {
   return (
     <div className="mt-1 text-xs text-muted-foreground">
       {calls.map((call) => {
+        // A view that opened is a card, not a disclosure: the user looks at it.
+        if (call.action?.logsView) {
+          return (
+            <LogsViewCard
+              key={call.id}
+              call={call}
+              action={call.action.logsView}
+              chatID={chatID}
+              clusterID={clusterID}
+              mode={mode}
+              until={ends.get(call.id) ?? null}
+            />
+          );
+        }
+        // So is a read: the user sees the lines the model read.
+        if (call.action?.logsRead) {
+          return (
+            <LogsReadCard
+              key={call.id}
+              call={call}
+              action={call.action.logsRead}
+              chatID={chatID}
+              clusterID={clusterID}
+              mode={mode}
+            />
+          );
+        }
+        // And a watch: the user sees what it waits for, then what it held.
+        if (call.action?.logsWatch) {
+          return (
+            <Fragment key={call.id}>
+              <LogsWatchCard
+                call={call}
+                action={call.action.logsWatch}
+                task={call.background}
+                chatID={chatID}
+                clusterID={clusterID}
+                mode={mode}
+              />
+              {call.background?.status === 'Running' && <StopTask id={call.id} />}
+            </Fragment>
+          );
+        }
         const summary = summaryOf(call);
         const line = descriptionLine(call.action?.description ?? '');
         const cwd = call.action?.command?.cwd ?? '';
@@ -557,6 +618,9 @@ function ToolCalls({
                   report={call.background?.report ?? ''}
                   modelLabel={modelLabel}
                   chatID={chatID}
+                  clusterID={clusterID}
+                  mode={mode}
+                  ends={ends}
                 />
               ) : (
                 <pre className="mt-1 border-l-2 border-muted pl-3 font-mono break-all whitespace-pre-wrap">
@@ -666,6 +730,18 @@ type SubagentCalls = ReadonlyMap<string, ChatToolCall[]>;
 const NO_CALLS: ChatToolCall[] = [];
 const NO_SUBAGENT_CALLS: SubagentCalls = new Map();
 
+/** Where each opened view ends, by call id: the next view's `resolvedAt`, null for the chat's newest. */
+export type ViewEnds = ReadonlyMap<string, string | null>;
+
+/**
+ * The views the chat's calls opened, in transcript order. Only the newest may run live; each
+ * older one stopped being live when the next one resolved. A refused call opened none.
+ */
+export function viewEnds(messages: ChatMessage[]): ViewEnds {
+  const opened = messages.flatMap((message) => message.toolCalls.filter((call) => call.action?.logsView));
+  return new Map(opened.map((call, i) => [call.id, opened[i + 1]?.action?.logsView?.resolvedAt ?? null]));
+}
+
 // An answer's calls split into its own and its subagents', which are drawn
 // inside their Agent call. A subagent's call awaiting approval is in neither: it
 // is the request.
@@ -695,12 +771,18 @@ function AgentBody({
   report,
   modelLabel,
   chatID,
+  clusterID,
+  mode,
+  ends,
 }: {
   delegate: DelegateAction;
   calls: ChatToolCall[];
   report: string;
   modelLabel: ModelLabel;
   chatID: string;
+  clusterID: string | undefined;
+  mode: AppMode;
+  ends: ViewEnds;
 }) {
   const kind = delegate.model === '' ? delegate.agentType : `${delegate.agentType} · ${modelLabel(delegate.model)}`;
   return (
@@ -710,7 +792,15 @@ function AgentBody({
       </p>
       <FoldedBlock text={delegate.prompt} className="mt-1 border-l-2 border-muted pl-3 break-all whitespace-pre-wrap" />
       {calls.length > 0 && (
-        <ToolCalls calls={calls} byAgent={NO_SUBAGENT_CALLS} modelLabel={modelLabel} chatID={chatID} />
+        <ToolCalls
+          calls={calls}
+          byAgent={NO_SUBAGENT_CALLS}
+          modelLabel={modelLabel}
+          chatID={chatID}
+          clusterID={clusterID}
+          mode={mode}
+          ends={ends}
+        />
       )}
       {report !== '' && (
         <div className="mt-1 border-l-2 border-muted pl-3 text-foreground">
@@ -735,22 +825,6 @@ function LabelledLine({ label, text, after }: { label: string; text: string; aft
       </span>
       {after && <span className="-ml-1 shrink-0 text-muted-foreground">{after}</span>}
     </p>
-  );
-}
-
-// The model's description of a command, as descriptionLine reads it: italic and
-// quoted, in the color of wherever it sits, so it reads as the model's claim and
-// never outshines the command. One line, cut by an ellipsis inside the quotes;
-// no title, since a native tooltip draws the text unspelled.
-function ModelDescription({ line }: { line: string }) {
-  return (
-    <span className="flex min-w-0 italic">
-      <span>“</span>
-      <span className="min-w-0 truncate">
-        <VisibleText text={line} />
-      </span>
-      <span>”</span>
-    </span>
   );
 }
 
@@ -1112,6 +1186,7 @@ function ApprovalRequest({
 // whether an agent started it: the answer that asked for it never drew the call.
 function noticeHead(notice: TaskNotice): string {
   if (notice.kind === 'agent') return agentNoticeEnd(notice);
+  if (notice.kind === 'watch') return watchNoticeEnd(notice);
   return noticeEnd(notice) + (notice.agentDescription !== '' ? ' · started by an agent' : '');
 }
 
@@ -1126,6 +1201,22 @@ function agentNoticeEnd(notice: TaskNotice): string {
       return notice.stoppedBy === 'unanswered' ? 'Agent stopped: no answer in 30 minutes' : 'Agent stopped';
     default:
       return 'Agent lost when Kstack stopped';
+  }
+}
+
+// A watch's end. Its lines are not drawn here: the user reads them on its card.
+function watchNoticeEnd(notice: TaskNotice): string {
+  switch (notice.status) {
+    case 'matched':
+      return 'Log watch matched';
+    case 'expired':
+      return 'Log watch ended: nothing matched';
+    case 'failed':
+      return 'Log watch failed';
+    case 'stopped':
+      return 'Log watch stopped';
+    default:
+      return 'Log watch lost when Kstack stopped';
   }
 }
 
@@ -1167,6 +1258,9 @@ function Notices({ notices }: { notices: TaskNotice[] }) {
 function Message({
   message,
   chatID,
+  clusterID,
+  mode,
+  ends,
   label,
   labelOf,
   onAskAgain,
@@ -1175,6 +1269,10 @@ function Message({
 }: {
   message: ChatMessage;
   chatID: string;
+  /** The chat's cluster, which a view's card sets with it. */
+  clusterID: string | undefined;
+  mode: AppMode;
+  ends: ViewEnds;
   approveArmMs: number;
   sandboxAvailable: boolean | undefined;
   /** The model this answer ran on, when it differs from the answer before it. */
@@ -1236,7 +1334,17 @@ function Message({
             <Spinner size="sm" />
           </span>
         )}
-        {done.length > 0 && <ToolCalls calls={done} byAgent={byAgent} modelLabel={modelLabel} chatID={chatID} />}
+        {done.length > 0 && (
+          <ToolCalls
+            calls={done}
+            byAgent={byAgent}
+            modelLabel={modelLabel}
+            chatID={chatID}
+            clusterID={clusterID}
+            mode={mode}
+            ends={ends}
+          />
+        )}
         {waiting.map(({ call, approval, change }) => (
           // Keyed on the approval, never the call or the message, so a decided
           // request's pressed state never reaches the next. Live while a run of
@@ -1325,6 +1433,7 @@ export function ChatTranscript({
   );
 
   const drawn = messages.filter(isDrawn);
+  const ends = viewEnds(messages);
   // Labelled where the model changed, so a switch is visible where it happened and a
   // chat that stayed on one model — the first answer included — stays unlabelled.
   let ran: string | undefined;
@@ -1373,6 +1482,9 @@ export function ChatTranscript({
         key={message.id}
         message={message}
         chatID={chatID}
+        clusterID={clusterID}
+        mode={mode}
+        ends={ends}
         label={label}
         labelOf={labelOf}
         onAskAgain={message.id === last?.id ? onAskAgain : undefined}

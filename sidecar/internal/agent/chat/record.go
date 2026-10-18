@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/kstackhq/kstack/sidecar/internal/agent/loop"
@@ -323,8 +324,9 @@ type ToolCall struct {
 	// ActionKind is what the call does, its tool's kind whatever the arguments
 	// hold; nil for a tool the box does not know.
 	ActionKind *tools.ActionKind `json:"actionKind"`
-	// Action is what the call does, read from its arguments by its own tool; nil
-	// when the tool has no way to show a call or refuses the arguments.
+	// Action is what the call does: what its tool resolved at the run, else what
+	// its tool reads off its arguments; nil when the tool has no way to show a call
+	// or refuses the arguments.
 	Action *tools.Action `json:"action"`
 	// Approval is the user's decision on the call; nil on a call no one was asked about.
 	Approval *ToolCallApproval `json:"approval"`
@@ -413,11 +415,14 @@ const (
 	BackgroundTaskExited    BackgroundTaskStatus = "Exited"
 	BackgroundTaskCompleted BackgroundTaskStatus = "Completed"
 	BackgroundTaskFailed    BackgroundTaskStatus = "Failed"
+	BackgroundTaskMatched   BackgroundTaskStatus = "Matched"
+	BackgroundTaskExpired   BackgroundTaskStatus = "Expired"
 	BackgroundTaskStopped   BackgroundTaskStatus = "Stopped"
 	BackgroundTaskLost      BackgroundTaskStatus = "Lost"
 )
 
-// BackgroundTask is a task a call started, off its row: a command, or an agent.
+// BackgroundTask is a task a call started, off its row: a command, an agent, or a
+// watch.
 type BackgroundTask struct {
 	Status BackgroundTaskStatus `json:"status"`
 	// ExitCode is set on an exited task whose code could be read.
@@ -425,12 +430,19 @@ type BackgroundTask struct {
 	// Report is a completed agent's report, cut to tools.InlineLimit since it
 	// rides every transcript read; empty for a command and until then.
 	Report string `json:"report"`
+	// Matched, EndedBecause and ViewAround are a finished watch's lines, why it
+	// ended and the view around its first line, off its result; empty or nil for
+	// every other task and while it runs.
+	Matched      []tools.LogsReadLine  `json:"matched"`
+	EndedBecause string                `json:"endedBecause"`
+	ViewAround   *tools.LogsViewAction `json:"viewAround"`
 }
 
 // backgroundTaskStatuses is the wire's spelling of each stored status.
 var backgroundTaskStatuses = map[string]BackgroundTaskStatus{
 	taskRunning: BackgroundTaskRunning, taskExited: BackgroundTaskExited,
 	taskCompleted: BackgroundTaskCompleted, taskFailed: BackgroundTaskFailed,
+	taskMatched: BackgroundTaskMatched, taskExpired: BackgroundTaskExpired,
 	taskStopped: BackgroundTaskStopped, taskLost: BackgroundTaskLost,
 }
 
@@ -439,10 +451,20 @@ func backgroundTaskOf(t *taskState) *BackgroundTask {
 	if t == nil {
 		return nil
 	}
-	b := &BackgroundTask{Status: backgroundTaskStatuses[t.Status], Report: tools.Cut(t.Report, 0, tools.InlineLimit, "")}
+	b := &BackgroundTask{
+		Status: backgroundTaskStatuses[t.Status], Report: tools.Cut(t.Report, 0, tools.InlineLimit, ""), Matched: []tools.LogsReadLine{},
+	}
 	if t.ExitCode.Valid {
 		code := int(t.ExitCode.Int64)
 		b.ExitCode = &code
+	}
+	if t.Result != "" {
+		r, err := watchResultOf(t.Result)
+		if err != nil {
+			slog.Warn("could not read a watch's result", "err", err)
+			return b
+		}
+		b.Matched, b.EndedBecause, b.ViewAround = r.Lines, r.EndedBecause, r.ViewAround
 	}
 	return b
 }
@@ -499,9 +521,12 @@ func marshalToolCalls(rows []toolCallEntry, box tools.Box) rawjson.RawJSON {
 	return rawjson.RawJSON(b)
 }
 
-// actionOf is what a stored call does, read through box, and nil when nothing
-// reads it (tools.Box.Action).
+// actionOf is what a stored call does: the action its run showed, else its
+// arguments read through box, and nil when nothing reads them (tools.Box.Action).
 func actionOf(box tools.Box, r toolCallEntry) *tools.Action {
+	if r.Shown != nil {
+		return r.Shown
+	}
 	a, ok := box.Action(r.Name, json.RawMessage(r.Arguments), r.Cwd, r.Sandboxed)
 	if !ok {
 		return nil

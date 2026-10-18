@@ -41,13 +41,13 @@ import (
 )
 
 // Read, Memory, Write, Edit and WebFetch work on every machine, so a machine with no shell is
-// offered them alone.
+// offered them, and TaskStop, since agents and watches start tasks there too.
 func TestTheFileToolsAreOfferedWithoutAShell(t *testing.T) {
 	box, err := chatTools(toolDeps{fenced: []string{t.TempDir()}, umask: 0o022})
 	require.NoError(t, err)
 
 	defs, native := box.Offer()
-	assert.Equal(t, []string{"Read", "Memory", "Write", "Edit", "WebFetch", "Agent", "KubeQuery"}, definitionNames(defs))
+	assert.Equal(t, []string{"Read", "Memory", "Write", "Edit", "WebFetch", "TaskStop", "Agent", "KubeQuery", "LogsView", "LogsRead", "LogsWatch"}, definitionNames(defs))
 	require.Len(t, native, 1)
 	assert.Equal(t, anthropicwebsearch.Name, native[0].Tool.Name())
 	got, ok := box.Action(bash.Name, json.RawMessage(`{"command":"ls"}`), "/srv", false)
@@ -428,6 +428,16 @@ func TestAppStartsKubeconfigBeforeTheClusterService(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, a.Close()) })
 
 	assert.Less(t, partIndex(t, a, "kubeconfig service"), partIndex(t, a, "cluster service"))
+}
+
+// The logs service owns the log files and is built over the cluster service, so it
+// closes first; the cache pass still removes a cache's file through it after that.
+func TestAppAddsTheLogsServiceAfterTheClusterService(t *testing.T) {
+	a, err := New(t.Context(), withDirs(t, Config{DataDir: t.TempDir()}))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, a.Close()) })
+
+	assert.Greater(t, partIndex(t, a, "logs service"), partIndex(t, a, "cluster service"))
 }
 
 // The chat service is a part like the others: built by New, started and stopped
