@@ -13,8 +13,11 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/lib/apimeta"
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
 	"github.com/kstackhq/kstack/sidecar/internal/run/permissions"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/logline"
 	"github.com/kstackhq/kstack/sidecar/internal/services/memory"
 	"github.com/kstackhq/kstack/sidecar/internal/services/settings"
+	"github.com/kstackhq/kstack/sidecar/internal/tools"
 )
 
 // The connecting principal's effective RBAC in one namespace (live
@@ -29,6 +32,101 @@ type ClusterPermissions struct {
 	NonResourceRules []*NonResourceRule `json:"nonResourceRules"`
 	// True if some authorizers couldn't be evaluated, so the rule set may be incomplete.
 	Incomplete bool `json:"incomplete"`
+}
+
+type LogRecordsPage struct {
+	Request *LogsFetchRequest `json:"request"`
+	// The first page's clock, which an open `until`'s `after` is measured from on every page.
+	ResolvedAt time.Time         `json:"resolvedAt"`
+	Page       *LogRecordsPlace  `json:"page"`
+	Records    []*logline.Record `json:"records"`
+	// Never null: empty with nothing to say.
+	Notices []*tools.LogsNotice `json:"notices"`
+}
+
+// The page's place in the window, each a page cursor to pass back as `cursor`, null where there is
+// none. A page cursor is an opaque string that holds everything the next page needs, and it never
+// expires. `prev` goes on toward older lines and `next` toward newer; `follow` polls a live window's
+// end for lines written since. A page going on from `next` or `follow` may hold a line stamped
+// older than one already read.
+type LogRecordsPlace struct {
+	Prev   *string `json:"prev,omitempty"`
+	Next   *string `json:"next,omitempty"`
+	Follow *string `json:"follow,omitempty"`
+}
+
+// One page: a first page, which gives `scope` and the window, or a continuation, which gives
+// `cursor` and nothing of them. The three caps are read on every page.
+type LogsFetchInput struct {
+	Scope *logs.Scope `json:"scope,omitempty"`
+	// The range's bounds, each including every line at that moment. Null is open.
+	Since *time.Time `json:"since,omitempty"`
+	Until *time.Time `json:"until,omitempty"`
+	// The window's padding past each bound.
+	Before *LogsPaddingInput `json:"before,omitempty"`
+	After  *LogsPaddingInput `json:"after,omitempty"`
+	// Required on a first page, omitted on a continuation: there is no default.
+	PageFrom *logs.PageFrom `json:"pageFrom,omitempty"`
+	// The last line the caller has of each stream, by its `cursor`: that stream reads past it, and the rest read from the window's start, or from where the page left them beside a `cursor`. Refused with `Last`, with padding on a first page, beside a `prev`, and beside a cursor whose `after` is a count.
+	Seen []string `json:"seen,omitempty"`
+	// A page's `prev`, `next` or `follow` as it came. It holds the scope and the window, so sending either beside it is refused.
+	Cursor *string `json:"cursor,omitempty"`
+	// 1 to 500; null or 0 is the server's default.
+	PageSize *int `json:"pageSize,omitempty"`
+	// Cuts each message; 0 is the server's cap.
+	MaxMessageBytes *int `json:"maxMessageBytes,omitempty"`
+	// Caps the page's messages together; 0 is the server's default.
+	MaxPageBytes *int `json:"maxPageBytes,omitempty"`
+}
+
+// The request as it ran: defaults filled, caps applied, and on a continuation the scope, range and padding the page cursor holds.
+type LogsFetchRequest struct {
+	Sources []*logs.ScopeSource `json:"sources"`
+	Filters []*logs.ScopeFilter `json:"filters"`
+	// The model may have written it, so draw it as text.
+	Grep   string             `json:"grep"`
+	Since  *time.Time         `json:"since,omitempty"`
+	Until  *time.Time         `json:"until,omitempty"`
+	Before *tools.LogsPadding `json:"before"`
+	After  *tools.LogsPadding `json:"after"`
+	// Null on a continuation.
+	PageFrom        *logs.PageFrom `json:"pageFrom,omitempty"`
+	PageSize        int            `json:"pageSize"`
+	MaxMessageBytes int            `json:"maxMessageBytes"`
+	MaxPageBytes    int            `json:"maxPageBytes"`
+}
+
+// One frame of a follow: a line, a notice, or the last frame, saying why the follow ended.
+// Following again after `Ended` would end the same way. Detect each frame by `type`, never by
+// which field is missing.
+type LogsFollowFrame struct {
+	Type LogsFollowFrameType `json:"type"`
+	// The line, cut at `maxMessageBytes`. Set on `Line`.
+	Record *logline.Record `json:"record,omitempty"`
+	// Something the follow wants the reader to know. Set on `Notice`.
+	Notice *tools.LogsNotice `json:"notice,omitempty"`
+	// Why the follow ended: its code, and the reason in the user's words. Set on `Ended`.
+	Ended *tools.LogsNotice `json:"ended,omitempty"`
+}
+
+// One follow: what to follow, and where it starts. With neither `since` nor `cursor` it starts from now.
+type LogsFollowInput struct {
+	// What is followed. Omitted beside `cursor`, which holds it.
+	Scope *logs.Scope `json:"scope,omitempty"`
+	// A start: that moment's lines included. Refused beside `cursor`.
+	Since *time.Time `json:"since,omitempty"`
+	// The last line the caller has of each stream, by its `cursor`: that stream reads past it, and a stream not named reads from the start. Refused alone.
+	Seen []string `json:"seen,omitempty"`
+	// A page's `next` or `follow`: each stream reads past where that page left it, and on past the page's window.
+	Cursor *string `json:"cursor,omitempty"`
+	// Cuts each message; 0 is the server's cap.
+	MaxMessageBytes *int `json:"maxMessageBytes,omitempty"`
+}
+
+// How far the window extends past one end of the range, to show the lines around it: a number of lines, or a span as an ISO 8601 duration such as `PT5M`, at most seven days. Give one.
+type LogsPaddingInput struct {
+	Lines *int    `json:"lines,omitempty"`
+	Span  *string `json:"span,omitempty"`
 }
 
 // One selected line, as the viewer holds it. Cluster text.
@@ -265,6 +363,63 @@ func (e *GrantDuration) UnmarshalJSON(b []byte) error {
 }
 
 func (e GrantDuration) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
+}
+
+type LogsFollowFrameType string
+
+const (
+	LogsFollowFrameTypeLine   LogsFollowFrameType = "Line"
+	LogsFollowFrameTypeNotice LogsFollowFrameType = "Notice"
+	LogsFollowFrameTypeEnded  LogsFollowFrameType = "Ended"
+)
+
+var AllLogsFollowFrameType = []LogsFollowFrameType{
+	LogsFollowFrameTypeLine,
+	LogsFollowFrameTypeNotice,
+	LogsFollowFrameTypeEnded,
+}
+
+func (e LogsFollowFrameType) IsValid() bool {
+	switch e {
+	case LogsFollowFrameTypeLine, LogsFollowFrameTypeNotice, LogsFollowFrameTypeEnded:
+		return true
+	}
+	return false
+}
+
+func (e LogsFollowFrameType) String() string {
+	return string(e)
+}
+
+func (e *LogsFollowFrameType) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = LogsFollowFrameType(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid LogsFollowFrameType", str)
+	}
+	return nil
+}
+
+func (e LogsFollowFrameType) MarshalGQL(w io.Writer) {
+	_, _ = fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *LogsFollowFrameType) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e LogsFollowFrameType) MarshalJSON() ([]byte, error) {
 	var buf bytes.Buffer
 	e.MarshalGQL(&buf)
 	return buf.Bytes(), nil

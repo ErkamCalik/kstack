@@ -17,6 +17,7 @@ package logswatch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -28,24 +29,33 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
 	"github.com/kstackhq/kstack/sidecar/internal/services/cluster"
 	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/logline"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/refusal"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/internal/logsinput"
 )
 
-// webappIn is a watch of the webapp deployment in payments for /panic/, with limit
-// and maxBytes.
+// record is a line of payments/webapp-a/app at offset past clock, the ordinal-th of
+// its moment, saying msg.
+func record(offset time.Duration, ordinal int, msg string) logline.Record {
+	return logline.Record{
+		Timestamp: clock.Add(offset), Message: msg,
+		Stream:      logline.StreamKey{Namespace: "payments", Pod: "webapp-a", Container: "app"},
+		ContainerID: "containerd://3f9a", Ordinal: ordinal,
+	}
+}
+
+// webappIn is a watch of the webapp deployment in payments for /panic/ from clock,
+// with limit and maxBytes.
 func webappIn(limit, maxBytes int) input {
 	return input{
-		Input: logsinput.Input{
-			Sources: []logsinput.Source{{Namespace: "payments", Kind: tools.LogsSourceDeployment, Name: "webapp"}},
-			Grep:    "panic",
-		},
+		Input: logsinput.Input{Grep: "panic"},
 		since: clock, limit: limit, maxBytes: maxBytes, until: clock.Add(time.Hour),
 	}
 }
 
-// webappView is the view webappIn resolves to.
-var webappView = tools.LogsViewInput{
+// webappScope is the scope webappIn's follow echoes.
+var webappScope = tools.LogsScopeInput{
 	Sources: []tools.LogsViewSource{{Namespace: "payments", Kind: tools.LogsSourceDeployment, Name: "webapp", Containers: []string{"app"}}},
 	Grep:    "panic",
 }
@@ -53,7 +63,7 @@ var webappView = tools.LogsViewInput{
 // followed is a watch over a follow that sends frames, then holds until its
 // context ends and returns err, or, as the service does, returns at once after an
 // Ended frame; sent closes once every frame it could send is on its way. The
-// clock reads ended at the end.
+// clock reads ten minutes past clock at the end.
 type followed struct {
 	w    *watch
 	sent chan struct{}
@@ -72,14 +82,15 @@ func follow(t *testing.T, in input, err error, frames ...logs.FollowFrame) follo
 			}
 		}
 		close(sent)
-		if n := len(frames); n > 0 && frames[n-1].Type == logs.FollowEnded {
+		if n := len(frames); n > 0 && frames[n-1].Ended != nil {
 			return nil
 		}
 		<-ctx.Done()
 		return err
 	})
 	end := clock.Add(10 * time.Minute)
-	w := &watch{ctx: ctx, cancel: cancel, stream: stream, in: in, view: webappView, now: func() time.Time { return end }}
+	since := in.since
+	w := &watch{ctx: ctx, cancel: cancel, stream: stream, in: in, scope: webappScope, since: &since, now: func() time.Time { return end }}
 	return followed{w: w, sent: sent}
 }
 
@@ -105,13 +116,19 @@ func (f followed) waited(t *testing.T) {
 	testutil.Wait(t, done, "the watch's end")
 }
 
-func line(rec logs.Record) logs.FollowFrame {
-	return logs.FollowFrame{Type: logs.FollowLine, Record: &rec}
+func line(rec logline.Record) logs.FollowFrame { return logs.FollowFrame{Record: &rec} }
+
+func notice(code refusal.Code, msg string) logs.FollowFrame {
+	return logs.FollowFrame{Notice: &logs.Notice{Code: code, Message: msg}}
 }
 
-// The first line ends a watch with a limit of 1: it holds the line, cancels the
-// follow, and its sample names one cursor, which reads both ways. A stop that
-// lands as the stream drains does not make it stopped.
+func ended(reason string) logs.FollowFrame {
+	r := refusal.New(refusal.CodeFinished, reason)
+	return logs.FollowFrame{Ended: &r}
+}
+
+// The first line ends a watch with a limit of 1: it holds the line and cancels
+// the follow. A stop that lands as the stream drains does not make it stopped.
 func TestTheFirstLineEndsAWatchOfOne(t *testing.T) {
 	t.Parallel()
 	a := record(time.Minute, 0, "panic: nil map")
@@ -122,40 +139,30 @@ func TestTheFirstLineEndsAWatchOfOne(t *testing.T) {
 	assert.Equal(t, tools.WatchMatched, end.Status)
 	assert.Equal(t, "it reached its line limit", end.Result.EndedBecause)
 	assert.Equal(t, []tools.LogsReadLine{logsinput.ReadLine(a)}, end.Result.Lines)
-	c := logsinput.EncodeCursor(a)
-	assert.Equal(t, "Watched 1 line of deployments/webapp in payments matching /panic/ from 2026-10-18T13:50:00Z until 2026-10-18T14:00:00Z, "+
-		"ended because it reached its line limit. To read around it, call LogsRead with this cursor as until, with mode: tail, "+
-		"for what came before, or as since for what followed: "+c+"\n"+
-		"2026-10-18T13:51:00Z payments/webapp-a/app panic: nil map", end.Result.Text)
-	assert.Equal(t, logsinput.ViewAround(webappView, a.Timestamp, clock.Add(10*time.Minute)), end.Result.ViewAround)
+	assert.Equal(t, "Watched 1 line of deployments/webapp in payments matching /panic/ from 2026-10-18T13:50:00.000000000Z until 2026-10-18T14:00:00.000000000Z, "+
+		"ended because it reached its line limit.\n"+
+		"2026-10-18T13:51:00.000000000Z payments/webapp-a/app panic: nil map", end.Result.Text)
+	assert.Equal(t, logsinput.ViewAround(webappScope, a.Timestamp, clock.Add(10*time.Minute)), end.Result.ViewAround)
 	assert.Error(t, f.w.ctx.Err(), "the follow is let go")
 }
 
-// The line that reaches the limit ends it; the lines are oldest first, checkpoints
-// count for nothing, and the header names the first line's cursor to read back
-// from and the last's to read on from.
+// The line that reaches the limit ends it, and the lines are oldest first.
 func TestTheLimitthLineEndsIt(t *testing.T) {
 	t.Parallel()
 	a, b, c := record(time.Second, 0, "panic: a"), record(2*time.Second, 0, "panic: b"), record(3*time.Second, 0, "panic: c")
-	checkpoint := "x"
-	f := follow(t, webappIn(3, logsinput.SampleBudget), nil,
-		line(a), logs.FollowFrame{Type: logs.FollowCheckpoint, Cursor: &checkpoint}, line(b), line(c), line(record(4*time.Second, 0, "panic: d")))
+	f := follow(t, webappIn(3, logsinput.SampleBudget), nil, line(a), line(b), line(c), line(record(4*time.Second, 0, "panic: d")))
 	f.waited(t)
 
 	end := f.w.End("")
 	assert.Equal(t, tools.WatchMatched, end.Status)
 	require.Len(t, end.Result.Lines, 3)
 	assert.Equal(t, "panic: c", end.Result.Lines[2].Message)
-	header := strings.Split(end.Result.Text, "\n")[0]
-	assert.True(t, strings.HasSuffix(header, "To read what came before, call LogsRead with mode: tail and until: "+logsinput.EncodeCursor(a)+
-		"; what followed, with since: "+logsinput.EncodeCursor(c)), header)
-	assert.True(t, strings.HasPrefix(header, "Watched 3 lines of deployments/webapp in payments"), header)
+	assert.True(t, strings.HasPrefix(end.Result.Text, "Watched 3 lines of deployments/webapp in payments"), end.Result.Text)
 }
 
 // Lines from another container that arrive later with an earlier moment are put
-// in the service's order once the follow is done, lines at one moment by pod, so
-// the sample is oldest first and the cursors and the view around are the first
-// and last lines'.
+// in the service's order once the follow is done, so the sample is oldest first
+// and the view around is the first line's.
 func TestLinesAreOrderedAcrossContainers(t *testing.T) {
 	t.Parallel()
 	a, b, c := record(time.Second, 0, "panic: a"), record(2*time.Second, 0, "panic: b"), record(2*time.Second, 0, "panic: c")
@@ -166,32 +173,60 @@ func TestLinesAreOrderedAcrossContainers(t *testing.T) {
 
 	end := f.w.End("")
 	assert.Equal(t, []tools.LogsReadLine{logsinput.ReadLine(a), logsinput.ReadLine(b), logsinput.ReadLine(c)}, end.Result.Lines)
-	header := strings.Split(end.Result.Text, "\n")[0]
-	assert.True(t, strings.HasSuffix(header, "until: "+logsinput.EncodeCursor(a)+"; what followed, with since: "+logsinput.EncodeCursor(c)), header)
 	assert.Equal(t, a.Timestamp, *end.Result.ViewAround.Anchor.At)
 }
 
 // Lines that reach the byte limit end it before the line limit, keeping the line
-// that reached it; each message is redacted, then cut.
+// that reached it; a line the service cut is held cut, saying so, its message
+// through ForModel.
 func TestTheByteLimitEndsItOnTheLineThatReachesIt(t *testing.T) {
 	t.Parallel()
-	long := strings.Repeat("x", logsinput.MaxSampleLine-8) + " sk-" + strings.Repeat("A", 30)
-	f := follow(t, webappIn(100, 100), nil, line(record(time.Second, 0, "panic: a")), line(record(2*time.Second, 0, long)), line(record(3*time.Second, 0, "c")))
+	cut := record(2*time.Second, 0, "\x1b[31mpanic: b")
+	cut.TruncatedBytes = 900
+	f := follow(t, webappIn(100, 100), nil, line(record(time.Second, 0, "panic: a")), line(cut), line(record(3*time.Second, 0, "c")))
 	f.waited(t)
 
 	end := f.w.End("")
 	assert.Equal(t, tools.WatchMatched, end.Status)
 	assert.Equal(t, "it reached its byte limit", end.Result.EndedBecause)
 	require.Len(t, end.Result.Lines, 2)
-	cut := end.Result.Lines[1].Message
-	assert.LessOrEqual(t, len(cut), logsinput.MaxSampleLine)
-	assert.NotContains(t, cut, "sk-AAAA", "redacted before the cut")
+	assert.Equal(t, "panic: b", end.Result.Lines[1].Message)
+	assert.Equal(t, 900, end.Result.Lines[1].TruncatedBytes)
+	assert.True(t, strings.HasSuffix(end.Result.Text, "payments/webapp-a/app panic: b … [900 bytes cut]"), end.Result.Text)
+}
+
+// A notice is kept for the header, after why the watch ended, while the notices
+// fit their budget; past it each is counted. A notice is no line.
+func TestNoticesPrintInTheHeader(t *testing.T) {
+	t.Parallel()
+	frames := []logs.FollowFrame{line(record(time.Second, 0, "panic: a"))}
+	for i := range 100 {
+		frames = append(frames, notice(refusal.CodeStreamSkipped, fmt.Sprintf("payments/webapp-%d/app: the server refused to read its log", i)))
+	}
+	f := follow(t, webappIn(3, logsinput.SampleBudget), nil, frames...)
+	done := make(chan struct{})
+	go func() {
+		f.w.Wait()
+		close(done)
+	}()
+	testutil.Wait(t, f.sent, "the frames")
+	f.w.Stop()
+	testutil.Wait(t, done, "the watch's end")
+
+	end := f.w.End("model")
+	require.Len(t, end.Result.Lines, 1)
+	lines := strings.Split(end.Result.Text, "\n")
+	assert.True(t, strings.HasSuffix(lines[0], "ended because it was stopped with TaskStop."), lines[0])
+	assert.Equal(t, "notice: stream-skipped: payments/webapp-0/app: the server refused to read its log", lines[1])
+	kept := len(lines) - 3
+	assert.Less(t, kept, 100)
+	assert.Equal(t, fmt.Sprintf("notice: %d more notices left out", 100-kept), lines[len(lines)-2])
+	assert.LessOrEqual(t, len(strings.Join(lines[1:1+kept], "\n")), logsinput.NoticesBudget)
+	assert.Equal(t, "2026-10-18T13:50:01.000000000Z payments/webapp-a/app panic: a", lines[len(lines)-1])
 }
 
 // A deadline with lines held is matched, at its time; with none, expired, its
-// sample naming the window. A stop, a fill and the deadline close the stream the
-// same way, and the watch tells them apart: a stop that lands as the stream
-// drains after either relabels nothing.
+// sample naming the window.
 func TestTheDeadlineEndsItMatchedOrExpired(t *testing.T) {
 	t.Parallel()
 	held := follow(t, webappIn(3, logsinput.SampleBudget), nil, line(record(time.Second, 0, "panic: a")))
@@ -209,14 +244,24 @@ func TestTheDeadlineEndsItMatchedOrExpired(t *testing.T) {
 	assert.Equal(t, tools.WatchExpired, end.Status)
 	assert.Equal(t, []tools.LogsReadLine{}, end.Result.Lines)
 	assert.Nil(t, end.Result.ViewAround)
-	assert.Equal(t, "No line of deployments/webapp in payments matched /panic/ between 2026-10-18T13:50:00Z and 2026-10-18T14:00:00Z.", end.Result.Text)
+	assert.Equal(t, "No line of deployments/webapp in payments matched /panic/ between 2026-10-18T13:50:00.000000000Z and 2026-10-18T14:00:00.000000000Z.", end.Result.Text)
 
 	anyLine := webappIn(1, logsinput.SampleBudget)
-	anyLine.Grep = ""
 	quiet := follow(t, anyLine, nil)
+	quiet.w.scope.Grep = ""
 	quiet.expire(t)
 	quiet.waited(t)
-	assert.Equal(t, "No line of deployments/webapp in payments was written between 2026-10-18T13:50:00Z and 2026-10-18T14:00:00Z.", quiet.w.End("").Result.Text)
+	assert.Equal(t, "No line of deployments/webapp in payments was written between 2026-10-18T13:50:00.000000000Z and 2026-10-18T14:00:00.000000000Z.", quiet.w.End("").Result.Text)
+}
+
+// A watch from a read's token names no moment it started at.
+func TestATokensWatchSaysWhereItStarted(t *testing.T) {
+	t.Parallel()
+	f := follow(t, webappIn(3, logsinput.SampleBudget), nil)
+	f.w.since = nil
+	f.expire(t)
+	f.waited(t)
+	assert.Equal(t, "No line of deployments/webapp in payments matched /panic/ from a read's token until 2026-10-18T14:00:00.000000000Z.", f.w.End("").Result.Text)
 }
 
 // A stop ends a watch stopped, keeping the lines it held, in the words of who
@@ -246,32 +291,32 @@ func TestAStopKeepsTheLines(t *testing.T) {
 	f.waited(t)
 	end := f.w.End(llm.TaskStoppedByUser)
 	assert.Equal(t, tools.WatchStopped, end.Status)
-	assert.Equal(t, "No line of deployments/webapp in payments matched /panic/ between 2026-10-18T13:50:00Z and 2026-10-18T14:00:00Z; "+
+	assert.Equal(t, "No line of deployments/webapp in payments matched /panic/ between 2026-10-18T13:50:00.000000000Z and 2026-10-18T14:00:00.000000000Z; "+
 		"the watch ended because the user stopped it.", end.Result.Text)
 }
 
-// The follow's own end ends the watch with its reason, stripped and redacted: with
-// lines held it is matched, with none it failed.
+// The follow's Ended frame ends the watch with its reason, stripped and redacted:
+// with lines held it is matched, with none it failed.
 func TestTheFollowsEndEndsIt(t *testing.T) {
 	t.Parallel()
-	ended := logs.FollowFrame{Type: logs.FollowEnded, Reason: "every container of this view has stopped \x1b[31m"}
+	end := ended("every container of this view has stopped \x1b[31m")
 
-	held := follow(t, webappIn(3, logsinput.SampleBudget), nil, line(record(time.Second, 0, "panic: a")), ended)
+	held := follow(t, webappIn(3, logsinput.SampleBudget), nil, line(record(time.Second, 0, "panic: a")), end)
 	held.waited(t)
-	end := held.w.End("")
-	assert.Equal(t, tools.WatchMatched, end.Status)
-	assert.Equal(t, "every container of this view has stopped", end.Result.EndedBecause)
+	got := held.w.End("")
+	assert.Equal(t, tools.WatchMatched, got.Status)
+	assert.Equal(t, "every container of this view has stopped", got.Result.EndedBecause)
 
-	none := follow(t, webappIn(3, logsinput.SampleBudget), nil, ended)
+	none := follow(t, webappIn(3, logsinput.SampleBudget), nil, end)
 	none.waited(t)
-	end = none.w.End("")
-	assert.Equal(t, tools.WatchFailed, end.Status)
-	assert.Equal(t, "every container of this view has stopped", end.Result.EndedBecause)
-	assert.Contains(t, end.Result.Text, "the watch ended because every container of this view has stopped.")
+	got = none.w.End("")
+	assert.Equal(t, tools.WatchFailed, got.Status)
+	assert.Equal(t, "every container of this view has stopped", got.Result.EndedBecause)
+	assert.Contains(t, got.Result.Text, "the watch ended because every container of this view has stopped.")
 }
 
 // A follow that ends on an error ends the watch with none of its text: failed
-// with no line held, matched with one, as the follow's own end does.
+// with no line held, matched with one.
 func TestAFollowErrorEndsItWithNoText(t *testing.T) {
 	t.Parallel()
 	a := record(time.Second, 0, "panic: a")
@@ -283,7 +328,8 @@ func TestAFollowErrorEndsItWithNoText(t *testing.T) {
 			return errors.New("the log file closed: /secret/path")
 		})
 		ctx, cancel := context.WithCancel(context.Background())
-		w := &watch{ctx: ctx, cancel: cancel, stream: broken, in: webappIn(3, logsinput.SampleBudget), view: webappView, now: func() time.Time { return clock }}
+		since := clock
+		w := &watch{ctx: ctx, cancel: cancel, stream: broken, in: webappIn(3, logsinput.SampleBudget), scope: webappScope, since: &since, now: func() time.Time { return clock }}
 		w.Wait()
 
 		end := w.End("")
@@ -299,37 +345,22 @@ func TestAFollowErrorEndsItWithNoText(t *testing.T) {
 	}
 }
 
-// No sample a watch holds passes the inline limit, however long its lines, and its
-// cursors are printed after the redaction, which could change them.
+// No sample a watch holds passes the inline limit: max_bytes bounds its lines, and
+// the notices' budget its notices.
 func TestNoSamplePassesTheInlineLimit(t *testing.T) {
 	t.Parallel()
 	var frames []logs.FollowFrame
-	for i := range maxLimit {
-		rec := record(time.Duration(i)*time.Second+time.Nanosecond, 0, strings.Repeat("m", logsinput.MaxSampleLine*2))
-		rec.Gap = &logs.Gap{After: rec.Timestamp.Add(-time.Second), Before: rec.Timestamp}
+	for i := range 200 {
+		frames = append(frames, notice(refusal.CodeStreamSkipped, strings.Repeat("n", 200)))
+		rec := record(time.Duration(i)*time.Second, 0, strings.Repeat("m", logsinput.DefaultMessageBytes))
+		rec.TruncatedBytes = logline.MaxLine
+		rec.Gap = &logline.Gap{After: rec.Timestamp.Add(-time.Second), Before: rec.Timestamp}
 		frames = append(frames, line(rec))
 	}
 	in := webappIn(maxLimit, logsinput.SampleBudget)
-	in.Grep = strings.Repeat("g", 1024)
 	f := follow(t, in, nil, frames...)
+	f.w.scope.Grep = strings.Repeat("g", logline.MaxGrep)
 	f.waited(t)
 
-	end := f.w.End("")
-	assert.Less(t, len(end.Result.Text), tools.InlineLimit)
-	assert.Contains(t, end.Result.Text, logsinput.EncodeCursor(record(time.Nanosecond, 0, "")))
-}
-
-// The cursors are printed after the header's redaction, which would otherwise take
-// them with a credential's line: a pattern that reads like one redacts the rest.
-func TestTheCursorsArePrintedAfterTheRedaction(t *testing.T) {
-	t.Parallel()
-	in := webappIn(1, logsinput.SampleBudget)
-	in.Grep = "api-key:"
-	a := record(time.Second, 0, "panic")
-	f := follow(t, in, nil, line(a))
-	f.waited(t)
-
-	header := strings.Split(f.w.End("").Result.Text, "\n")[0]
-	assert.True(t, strings.HasSuffix(header, "or as since for what followed: "+logsinput.EncodeCursor(a)), header)
-	assert.NotContains(t, header, "ended because", "the redaction took the rest of the header's line")
+	assert.Less(t, len(f.w.End("").Result.Text), tools.InlineLimit)
 }

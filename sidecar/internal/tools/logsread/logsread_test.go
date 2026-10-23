@@ -17,7 +17,6 @@ package logsread
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -28,55 +27,48 @@ import (
 
 	"github.com/kstackhq/kstack/sidecar/internal/services/cluster"
 	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/logstest"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/refusal"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/internal/logsinput"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/internal/logsinput/logsinputtest"
 )
 
-// record is a line of prod/webapp-a/app at offset past 09:14, the ordinal-th of its
-// moment, saying msg.
-func record(offset time.Duration, ordinal int, msg string) logs.Record {
-	return logs.Record{
-		Timestamp: time.Date(2026, 10, 17, 9, 14, 0, 0, time.UTC).Add(offset), Message: msg,
-		Stream:      logs.StreamKey{Namespace: "prod", Pod: "webapp-a", Container: "app"},
-		ContainerID: "containerd://3f9a", Ordinal: ordinal,
-	}
+func TestTheToolIsAShownBoundedRead(t *testing.T) {
+	t.Parallel()
+	tool := New(nil, nil)
+	def := tool.Definition()
+	assert.Equal(t, Name, def.Name)
+	assert.Equal(t, description, def.Description)
+	assert.JSONEq(t, string(inputSchema), string(def.InputSchema))
+	assert.Equal(t, tools.ActionLogsRead, tool.ActionKind())
+	assert.Equal(t, prompt, tool.Prompt())
+	_, err := tool.Action(json.RawMessage(`{"sources":[{"namespace":"prod","resource":"deployments/webapp"}]}`), "", false)
+	assert.ErrorIs(t, err, errNotShown)
 }
 
-// fakeLogs is the log service as the tool reads it: one page or error for every
-// fetch, each fetch's view and query kept.
-type fakeLogs struct {
-	page    logs.Page
-	err     error
-	queries []logs.FetchQuery
-	views   []logs.View
-	// wait holds a fetch until its context ends.
-	wait bool
-}
-
-func (f *fakeLogs) Fetch(ctx context.Context, _ cluster.ClusterID, view logs.View, q logs.FetchQuery) (logs.Page, error) {
-	f.views, f.queries = append(f.views, view), append(f.queries, q)
-	if f.wait {
-		<-ctx.Done()
-		return logs.Page{}, ctx.Err()
-	}
-	return f.page, f.err
-}
-
-// run calls the tool over the watching cluster and l with raw, for cluster 7, and
-// answers what the model reads and the action.
-func run(t *testing.T, l *fakeLogs, raw string) (string, bool, *tools.Action) {
+// webappLogs is the webapp fixture with lines in webapp-a's app container, each a
+// second apart from 10:00 saying msgs in turn.
+func webappLogs(t *testing.T, msgs ...string) *logsinputtest.Logs {
 	t.Helper()
-	return runOver(t, logsinputtest.Watching(t), l, raw)
+	l := logsinputtest.LogsOf(t, logsinputtest.WebappObjects()...)
+	for i, msg := range msgs {
+		l.Add("webapp-a", "app", logstest.Stamped(time.Duration(i)*time.Second, msg))
+	}
+	return l
 }
 
-func runOver(t *testing.T, f *logsinputtest.Service, l *fakeLogs, raw string) (string, bool, *tools.Action) {
+// run calls the tool over l with raw, for cluster 7, and answers what the model
+// reads and the action.
+func run(t *testing.T, l *logsinputtest.Logs, raw string) (string, bool, *tools.Action) {
 	t.Helper()
-	return New(f, l, func() time.Time { return clock }).RunShown(t.Context(), tools.Runtime{ClusterID: "7"}, json.RawMessage(raw))
+	tool := New(l.Service, l.Logs)
+	tool.now = func() time.Time { return clock }
+	return tool.RunShown(t.Context(), tools.Runtime{ClusterID: "7"}, json.RawMessage(raw))
 }
 
-// readOf is the read a call answers, which must read.
-func readOf(t *testing.T, l *fakeLogs, raw string) (string, tools.LogsReadAction) {
+// readOf is the read a call over l answers, which must read.
+func readOf(t *testing.T, l *logsinputtest.Logs, raw string) (string, tools.LogsReadAction) {
 	t.Helper()
 	text, isError, shown := run(t, l, raw)
 	require.False(t, isError, text)
@@ -85,333 +77,390 @@ func readOf(t *testing.T, l *fakeLogs, raw string) (string, tools.LogsReadAction
 	return text, *shown.LogsRead
 }
 
-// pod is the webapp deployment's view in prod, one pod's app container read.
-const webapp = `{"sources":[{"namespace":"prod","resource":"deployments/webapp","containers":["app"]}]`
-
-// The model reads a header, then one line per record, oldest first; the action
-// holds the same lines, and the service is asked for the range as the call named it.
-func TestAHeadReadFromAMoment(t *testing.T) {
+// A first page is a header of the read in words, the request as it ran and the
+// page's tokens, then one line per record, oldest first.
+func TestAFirstPage(t *testing.T) {
 	t.Parallel()
-	since := "2026-10-17T09:13:00Z"
-	l := &fakeLogs{page: logs.Page{
-		Records: []logs.Record{record(19*time.Second+870*time.Millisecond, 0, "error: upstream timed out"), record(20*time.Second+4*time.Millisecond, 0, "panic: nil map")},
-		Before:  logs.PageEdge{Cursor: &since, More: true},
-	}}
+	l := webappLogs(t, "start", "error: one", "fine", "error: two")
 
-	text, read := readOf(t, l, webapp+`,"since":"`+since+`","grep":"error|panic"}`)
+	text, _ := readOf(t, l, webapp+`,"grep":"error","since":"2026-10-08T10:00:00Z","until":"2026-10-08T10:00:05Z"}`)
 
-	assert.Equal(t, "Read 2 lines of deployments/webapp in prod from 2026-10-17T09:13:00Z, oldest first, matching /error|panic/. Container app. Older lines may exist.\n"+
-		"2026-10-17T09:14:19.87Z prod/webapp-a/app error: upstream timed out\n"+
-		"2026-10-17T09:14:20.004Z prod/webapp-a/app panic: nil map", text)
-	assert.Equal(t, []logs.FetchQuery{{Mode: logs.FetchHead, Since: &since, Limit: 50}}, l.queries)
-	assert.Equal(t, "error|panic", l.views[0].Grep)
-	at := time.Date(2026, 10, 17, 9, 13, 0, 0, time.UTC)
-	assert.Equal(t, &at, read.Since)
-	assert.Nil(t, read.Until)
-	assert.Equal(t, tools.LogsReadHead, read.Mode)
-	assert.Equal(t, clock, read.ResolvedAt)
-	assert.Equal(t, tools.LogsReadUnread, read.Before)
-	assert.Equal(t, tools.LogsReadEnd, read.After)
-	assert.Equal(t, []string{}, read.Skipped)
-	assert.Equal(t, "webapp", read.Sources[0].Name)
+	assert.Equal(t, "Read 2 lines of deployments/webapp in prod, matching /error/. Defaulted container app out of app, istio-proxy, setup.\n"+
+		"request: since=2026-10-08T10:00:00.000000000Z until=2026-10-08T10:00:05.999999999Z before=0 after=0 page_from=last page_size=50 max_message_bytes=2048 max_page_bytes=16384\n"+
+		"page: prev=none next=none follow=none\n"+
+		"2026-10-08T10:00:01.000000000Z prod/webapp-a/app error: one\n"+
+		"2026-10-08T10:00:03.000000000Z prod/webapp-a/app error: two", text)
 }
 
-// The action's lines are the output's record lines, in order, field for field.
-func TestTheActionIsTheSample(t *testing.T) {
-	t.Parallel()
-	prev := record(2*time.Second, 1, "b")
-	prev.Stream.Previous = true
-	l := &fakeLogs{page: logs.Page{Records: []logs.Record{record(time.Second, 0, "a"), prev}}}
-
-	text, read := readOf(t, l, webapp+`}`)
-
-	lines := strings.Split(text, "\n")[1:]
-	require.Len(t, read.Lines, len(lines))
-	for i, line := range read.Lines {
-		stream := line.Namespace + "/" + line.Pod + "/" + line.Container
-		if line.Previous {
-			stream += " (previous)"
+// pageOf is the page line of a read's output, split into its three tokens, "" for
+// none.
+func pageOf(t *testing.T, text string) (prev, next, follow string) {
+	t.Helper()
+	lines := strings.Split(text, "\n")
+	require.GreaterOrEqual(t, len(lines), 3, text)
+	fields := strings.Fields(strings.TrimPrefix(lines[2], "page: "))
+	require.Len(t, fields, 3, lines[2])
+	token := func(field, key string) string {
+		v := strings.TrimPrefix(field, key+"=")
+		if v == "none" {
+			return ""
 		}
-		assert.Equal(t, line.Timestamp.Format(time.RFC3339Nano)+" "+stream+" "+line.Message, lines[i])
+		return v
 	}
-	assert.Equal(t, tools.LogsReadLine{Timestamp: prev.Timestamp, Namespace: "prod", Pod: "webapp-a", Container: "app", Previous: true, Message: "b"}, read.Lines[1])
+	return token(fields[0], "prev"), token(fields[1], "next"), token(fields[2], "follow")
 }
 
-// firstLine is text's header.
-func firstLine(text string) string { return strings.Split(text, "\n")[0] }
-
-// A read with more past its far end prints the cursor to read on from: a head read
-// its last line's after since, a tail read its first line's after until. A read that
-// reached its far bound prints none.
-func TestAReadWithMorePrintsWhereToReadOn(t *testing.T) {
-	t.Parallel()
-	a, b := record(time.Second, 0, "a"), record(2*time.Second, 0, "b")
-	more := logs.PageEdge{More: true}
-
-	text, read := readOf(t, &fakeLogs{page: logs.Page{Records: []logs.Record{a, b}, After: more}}, webapp+`}`)
-	assert.Equal(t, "Read 2 lines of deployments/webapp in prod, oldest first. Container app. More lines follow; to read on, since: "+logsinput.EncodeCursor(b), firstLine(text))
-	assert.Equal(t, tools.LogsReadEnd, read.Before)
-	assert.Equal(t, tools.LogsReadMore, read.After)
-
-	text, read = readOf(t, &fakeLogs{page: logs.Page{Records: []logs.Record{a, b}, Before: more}}, webapp+`,"mode":"tail"}`)
-	assert.Equal(t, "Read 2 lines of deployments/webapp in prod, the newest. Container app. Older lines exist; to read on, until: "+logsinput.EncodeCursor(a), firstLine(text))
-	assert.Equal(t, tools.LogsReadMore, read.Before)
-	assert.Equal(t, tools.LogsReadEnd, read.After)
-
-	text, read = readOf(t, &fakeLogs{page: logs.Page{Records: []logs.Record{a, b}}}, webapp+`,"until":"2026-10-17T09:15:00Z"}`)
-	assert.Equal(t, "Read 2 lines of deployments/webapp in prod up to 2026-10-17T09:15:00Z, oldest first. Container app. Newer lines may exist.", firstLine(text))
-	assert.Equal(t, tools.LogsReadUnread, read.After)
-}
-
-// A read continued from a printed cursor starts past its line, and the side it was
-// continued from has more: the lines the model just read. A moment on that side may
-// have more, and the action records each end's moment.
-func TestEachEndIsEndMoreOrUnread(t *testing.T) {
-	t.Parallel()
-	a := record(time.Second, 0, "a")
-	cursor := logsinput.EncodeCursor(a)
-
-	l := &fakeLogs{page: logs.Page{Records: []logs.Record{record(2*time.Second, 0, "b")}, Before: logs.PageEdge{More: true}}}
-	text, read := readOf(t, l, webapp+`,"since":"`+cursor+`"}`)
-	assert.Equal(t, a.Cursor(), *l.queries[0].Since)
-	assert.Equal(t, "Read 1 line of deployments/webapp in prod after 2026-10-17T09:14:01Z, oldest first. Container app. Older lines exist.", firstLine(text))
-	assert.Equal(t, tools.LogsReadMore, read.Before)
-	assert.Equal(t, a.Timestamp, *read.Since)
-
-	l = &fakeLogs{page: logs.Page{Records: []logs.Record{record(0, 0, "z")}, After: logs.PageEdge{More: true}}}
-	text, read = readOf(t, l, webapp+`,"until":"`+cursor+`","since":"2026-10-17T09:00:00Z","mode":"tail"}`)
-	assert.Equal(t, a.Cursor(), *l.queries[0].Until)
-	assert.Equal(t, "Read 1 line of deployments/webapp in prod from 2026-10-17T09:00:00Z before 2026-10-17T09:14:01Z, the newest. Container app. More lines follow. Older lines may exist.", firstLine(text))
-	assert.Equal(t, tools.LogsReadMore, read.After)
-	assert.Equal(t, tools.LogsReadUnread, read.Before)
-}
-
-// An empty range is a true answer: no lines between its ends.
-func TestAnEmptyRangeReadsNoLines(t *testing.T) {
-	t.Parallel()
-	text, read := readOf(t, &fakeLogs{page: logs.Page{}}, webapp+`,"since":"2026-10-17T09:00:00Z","until":"2026-10-17T09:05:00Z"}`)
-	assert.Equal(t, "No lines of deployments/webapp in prod between 2026-10-17T09:00:00Z and 2026-10-17T09:05:00Z. Container app. Older lines may exist. Newer lines may exist.", text)
-	assert.Equal(t, []tools.LogsReadLine{}, read.Lines)
-	assert.Nil(t, read.ViewAround)
-}
-
-// The cursor is printed after the header's redaction, which would otherwise take it
-// with the rest of a line that names a credential header.
-func TestTheCursorIsPrintedAfterTheRedaction(t *testing.T) {
-	t.Parallel()
-	b := record(2*time.Second, 0, "b")
-	text, _ := readOf(t, &fakeLogs{page: logs.Page{Records: []logs.Record{b}, After: logs.PageEdge{More: true}}}, webapp+`,"grep":"api-key:"}`)
-	assert.True(t, strings.HasSuffix(firstLine(text), "; to read on, since: "+logsinput.EncodeCursor(b)), firstLine(text))
-}
-
-// A record's hole is a line of the sidecar's before it, and the action line's gap.
-func TestAHoleIsALineBeforeItsRecord(t *testing.T) {
-	t.Parallel()
-	b := record(2*time.Second, 0, "b")
-	b.Gap = &logs.Gap{After: record(time.Second, 0, "").Timestamp, Before: b.Timestamp}
-
-	text, read := readOf(t, &fakeLogs{page: logs.Page{Records: []logs.Record{record(time.Second, 0, "a"), b}}}, webapp+`}`)
-
-	assert.Equal(t, []string{
-		"2026-10-17T09:14:01Z prod/webapp-a/app a",
-		"[lines may be missing from prod/webapp-a/app between 2026-10-17T09:14:01Z and 2026-10-17T09:14:02Z]",
-		"2026-10-17T09:14:02Z prod/webapp-a/app b",
-	}, strings.Split(text, "\n")[1:])
-	assert.Equal(t, b.Gap, read.Lines[1].Gap)
-	assert.Nil(t, read.Lines[0].Gap)
-}
-
-// A message is stripped and redacted before it is cut, so a secret the cut would
-// split is still redacted.
-func TestAMessageIsRedactedBeforeItIsCut(t *testing.T) {
-	t.Parallel()
-	long := strings.Repeat("x", logsinput.MaxSampleLine-8) + " sk-" + strings.Repeat("A", 30)
-	text, read := readOf(t, &fakeLogs{page: logs.Page{Records: []logs.Record{record(time.Second, 0, long), record(2*time.Second, 0, "\x1b[31mred\x1b[0m")}}}, webapp+`}`)
-
-	assert.NotContains(t, text, "sk-")
-	assert.NotContains(t, text, "\x1b")
-	assert.LessOrEqual(t, len(read.Lines[0].Message), logsinput.MaxSampleLine)
-	assert.NotContains(t, read.Lines[1].Message, "\x1b")
-	assert.LessOrEqual(t, len(logsinput.CutLine(strings.Repeat("é", logsinput.MaxSampleLine))), logsinput.MaxSampleLine)
-	assert.True(t, strings.HasSuffix(logsinput.CutLine(strings.Repeat("é", logsinput.MaxSampleLine)), "é…"))
-}
-
-// A sample past its budget drops lines from the far end, counts them, says more
-// lies that way, and reads on from the last line it kept.
-func TestASampleDropsPastItsBudget(t *testing.T) {
-	t.Parallel()
-	var recs []logs.Record
-	for i := range 100 {
-		recs = append(recs, record(time.Duration(i)*time.Second, 0, strings.Repeat("m", 1000)))
-	}
-
-	text, read := readOf(t, &fakeLogs{page: logs.Page{Records: recs}}, webapp+`,"limit":100}`)
-	kept := len(read.Lines)
-	assert.Less(t, kept, 100)
-	assert.Equal(t, 100-kept, read.Dropped)
-	assert.Equal(t, recs[0].Timestamp, read.Lines[0].Timestamp)
-	assert.Equal(t, tools.LogsReadMore, read.After)
-	assert.Contains(t, firstLine(text), fmt.Sprintf(" %d more lines were left out to fit.", read.Dropped))
-	assert.True(t, strings.HasSuffix(firstLine(text), "; to read on, since: "+logsinput.EncodeCursor(recs[kept-1])))
-	assert.LessOrEqual(t, len(text)-len(firstLine(text)), logsinput.SampleBudget)
-
-	text, read = readOf(t, &fakeLogs{page: logs.Page{Records: recs}}, webapp+`,"limit":100,"mode":"tail"}`)
-	assert.Equal(t, recs[99].Timestamp, read.Lines[len(read.Lines)-1].Timestamp)
-	assert.Equal(t, tools.LogsReadMore, read.Before)
-	assert.True(t, strings.HasSuffix(firstLine(text), "; to read on, until: "+logsinput.EncodeCursor(recs[100-len(read.Lines)])))
-}
-
-// longName is a distinct object name of the longest length, 253 characters.
-func longName(i int) string { return fmt.Sprintf("%s-%03d", strings.Repeat("a", 249), i) }
-
-// missingSources is n pods the mirror does not hold, each named at length.
-func missingSources(n int) string {
-	var sources []string
-	for i := range n {
-		sources = append(sources, `{"namespace":"prod","resource":"pods/`+longName(i)+`"}`)
-	}
-	return `{"sources":[` + strings.Join(sources, ",") + `]`
-}
-
-// skippedStreams is n lines naming a stream the page could not read, each at length.
-func skippedStreams(n int) []string {
-	var out []string
-	for i := range n {
-		out = append(out, longName(i)+"/"+strings.Repeat("c", 63)+": the server refused this log: forbidden")
+// messagesOf is each record line's message of a read's output.
+func messagesOf(text string) []string {
+	out := []string{}
+	for _, line := range strings.Split(text, "\n")[3:] {
+		if strings.HasPrefix(line, "notice: ") {
+			continue
+		}
+		out = append(out, line[strings.LastIndex(line, " ")+1:])
 	}
 	return out
 }
 
-// The header names skipped streams up to its budget and counts the rest; the
-// action keeps every one.
-func TestTheHeaderNamesSkippedStreamsUpToItsBudget(t *testing.T) {
+// A cursor reads on to the page it names: next and prev from a bounded window,
+// follow at a live window's end once a line was written. Its header names the
+// token's sources, with no notes, and its request line no page_from.
+func TestACursorReadsOn(t *testing.T) {
 	t.Parallel()
-	text, read := readOf(t, &fakeLogs{page: logs.Page{Skipped: skippedStreams(100)}}, webapp+`}`)
-	assert.Len(t, read.Skipped, 100)
-	assert.Contains(t, text, " Could not read "+read.Skipped[0])
-	assert.Regexp(t, `, and \d+ more streams\.`, text)
-	assert.Less(t, len(text), skippedBudget+500)
+	l := webappLogs(t, "m0", "m1", "m2", "m3", "m4")
+	bounded := webapp + `,"since":"2026-10-08T10:00:00Z","until":"2026-10-08T10:00:04Z","page_size":2`
+
+	text, _ := readOf(t, l, bounded+`,"page_from":"first"}`)
+	assert.Equal(t, []string{"m0", "m1"}, messagesOf(text))
+	_, next, _ := pageOf(t, text)
+	require.NotEmpty(t, next)
+	text, _ = readOf(t, l, `{"cursor":"`+next+`","page_size":2}`)
+	assert.Equal(t, []string{"m2", "m3"}, messagesOf(text))
+	assert.Equal(t, "Read 2 lines of deployments/webapp in prod.", strings.Split(text, "\n")[0])
+	assert.Equal(t, "request: since=2026-10-08T10:00:00.000000000Z until=2026-10-08T10:00:04.999999999Z before=0 after=0 page_size=2 max_message_bytes=2048 max_page_bytes=16384", strings.Split(text, "\n")[1])
+
+	text, _ = readOf(t, l, bounded+`}`)
+	assert.Equal(t, []string{"m3", "m4"}, messagesOf(text))
+	prev, _, _ := pageOf(t, text)
+	require.NotEmpty(t, prev)
+	text, _ = readOf(t, l, `{"cursor":"`+prev+`","page_size":2}`)
+	assert.Equal(t, []string{"m1", "m2"}, messagesOf(text))
+
+	text, _ = readOf(t, l, webapp+`,"since":"2026-10-08T10:00:00Z"}`)
+	assert.Equal(t, []string{"m0", "m1", "m2", "m3", "m4"}, messagesOf(text))
+	_, _, follow := pageOf(t, text)
+	require.NotEmpty(t, follow)
+	l.Add("webapp-a", "app", logstest.Stamped(5*time.Second, "m5"))
+	text, _ = readOf(t, l, `{"cursor":"`+follow+`"}`)
+	assert.Equal(t, []string{"m5"}, messagesOf(text))
 }
 
-// The header names each source's notes up to its budget and counts the sources
-// left out; the action keeps every source.
-func TestTheHeaderNamesNotesUpToItsBudget(t *testing.T) {
+// A token the service did not write is refused with the service's code.
+func TestABadCursorIsRefused(t *testing.T) {
 	t.Parallel()
-	text, read := readOf(t, &fakeLogs{}, missingSources(100)+`}`)
-	assert.Len(t, read.Sources, 100)
-	assert.Contains(t, text, "pods/"+longName(0)+": not in Kstack's cache of the cluster yet")
-	assert.Regexp(t, ` Notes on \d+ more sources left out\.`, text)
-	assert.Less(t, len(text), notesBudget+1000)
-}
-
-// No output passes the inline limit: the longest lines at the most of them, with
-// the most skipped streams and missing sources, all at length, and the longest grep.
-func TestNoOutputPassesTheInlineLimit(t *testing.T) {
-	t.Parallel()
-	var recs []logs.Record
-	for i := range 100 {
-		rec := record(time.Duration(i)*time.Second+time.Nanosecond, 0, strings.Repeat("m", logsinput.MaxSampleLine*2))
-		rec.Stream = logs.StreamKey{Namespace: strings.Repeat("n", 63), Pod: longName(i), Container: strings.Repeat("c", 63), Previous: true}
-		rec.Gap = &logs.Gap{After: rec.Timestamp, Before: rec.Timestamp}
-		recs = append(recs, rec)
-	}
-	page := logs.Page{Records: recs, After: logs.PageEdge{More: true}, Before: logs.PageEdge{More: true}, Skipped: skippedStreams(100)}
-	grep := strings.Repeat("g", logs.MaxGrep)
-	for _, mode := range []string{"head", "tail"} {
-		text, _ := readOf(t, &fakeLogs{page: page}, missingSources(100)+`,"grep":"`+grep+`","limit":100,"mode":"`+mode+`","since":"PT1H","until":"2026-10-17T09:59:59.999999999Z"}`)
-		assert.LessOrEqual(t, len(text), tools.InlineLimit, mode)
-	}
-}
-
-// refusalOf is the refusal a call answers, which must refuse with no action.
-func refusalOf(t *testing.T, f *logsinputtest.Service, l *fakeLogs, raw string) string {
-	t.Helper()
-	text, isError, shown := runOver(t, f, l, raw)
-	require.True(t, isError, text)
+	text, isError, shown := run(t, webappLogs(t), `{"cursor":"abc"}`)
+	assert.True(t, isError)
 	assert.Nil(t, shown)
-	return text
+	assert.Equal(t, `{"error":"cursor-invalid","message":"this is not a page cursor a page handed back"}`, text)
 }
 
-// A view the mirror refuses is refused as LogsView refuses it, before any read.
-func TestAViewTheMirrorRefusesIsRefused(t *testing.T) {
+// recorder is the log service with every request it was asked kept.
+type recorder struct {
+	Fetcher
+	asked []logs.FetchRequest
+}
+
+func (r *recorder) Fetch(ctx context.Context, id cluster.ClusterID, q logs.FetchRequest) (logs.FetchResponse, error) {
+	r.asked = append(r.asked, q)
+	return r.Fetcher.Fetch(ctx, id, q)
+}
+
+// Every page is asked for the model, so the service redacts each message before it
+// cuts it; a continuation sends its token and the caps alone.
+func TestEveryPageIsForTheModel(t *testing.T) {
 	t.Parallel()
-	l := &fakeLogs{}
-	assert.JSONEq(t, `{"error":"no-container","source":0,"containers":["app","istio-proxy","setup"]}`,
-		refusalOf(t, logsinputtest.Watching(t), l, `{"sources":[{"namespace":"prod","resource":"pods/webapp-a","containers":["nope"]}]}`))
-	assert.JSONEq(t, `{"error":"no-cache"}`, refusalOf(t, &logsinputtest.Service{ReadErr: cluster.ErrNotFound}, l, webapp+`}`))
-	syncing := logsinputtest.Watching(t)
-	syncing.CacheHealth.Reason = "Connecting"
-	assert.JSONEq(t, `{"error":"syncing"}`, refusalOf(t, syncing, l, webapp+`}`))
-	assert.Empty(t, l.queries)
+	l := webappLogs(t, "m0", "m1")
+	r := &recorder{Fetcher: l.Logs}
+	tool := New(l.Service, r)
+	tool.now = func() time.Time { return clock }
+	text, _, _ := tool.RunShown(t.Context(), tools.Runtime{ClusterID: "7"}, json.RawMessage(webapp+`,"page_size":1}`))
+	prev, _, _ := pageOf(t, text)
+	tool.RunShown(t.Context(), tools.Runtime{ClusterID: "7"}, json.RawMessage(`{"cursor":"`+prev+`","max_message_bytes":7}`))
+
+	require.Len(t, r.asked, 2)
+	assert.True(t, r.asked[0].ForModel)
+	assert.Equal(t, logs.FetchRequest{Cursor: &prev, PageSize: 50, MaxMessageBytes: 7, MaxPageBytes: 16384, ForModel: true}, r.asked[1])
 }
 
-// A read the service refuses answers its words, as a line is read; any other
-// failure carries none of its text.
-func TestAFailedReadIsRefused(t *testing.T) {
+// Padding lines are marked by their place: before since, or after until. A line at
+// either bound is in the range, since a bound takes its whole second.
+func TestPaddingIsMarked(t *testing.T) {
 	t.Parallel()
-	l := &fakeLogs{err: logs.Refusal{Reason: "no container of this view could be read: webapp-a/app: \x1b[31mdenied sk-" + strings.Repeat("A", 30)}}
-	text := refusalOf(t, logsinputtest.Watching(t), l, webapp+`}`)
-	assert.Contains(t, text, `"error":"refused"`)
-	assert.Contains(t, text, "no container of this view could be read: webapp-a/app")
-	assert.NotContains(t, text, "sk-")
-	assert.NotContains(t, text, "\x1b")
+	l := webappLogs(t, "m0", "m1", "m2", "m3", "m4", "m5", "m6")
 
-	l = &fakeLogs{err: errors.New("open /home/user/cache: disk I/O error")}
-	assert.JSONEq(t, `{"error":"read-failed"}`, refusalOf(t, logsinputtest.Watching(t), l, webapp+`}`))
+	text, read := readOf(t, l, webapp+`,"since":"2026-10-08T10:00:02Z","until":"2026-10-08T10:00:04Z","before":1,"after":"PT1S","page_from":"first"}`)
+
+	assert.Equal(t, []string{
+		"2026-10-08T10:00:01.000000000Z prod/webapp-a/app [before] m1",
+		"2026-10-08T10:00:02.000000000Z prod/webapp-a/app m2",
+		"2026-10-08T10:00:03.000000000Z prod/webapp-a/app m3",
+		"2026-10-08T10:00:04.000000000Z prod/webapp-a/app m4",
+		"2026-10-08T10:00:05.000000000Z prod/webapp-a/app [after] m5",
+	}, strings.Split(text, "\n")[3:])
+	assert.Equal(t, "request: since=2026-10-08T10:00:02.000000000Z until=2026-10-08T10:00:04.999999999Z before=1 after=PT1S page_from=first page_size=50 max_message_bytes=2048 max_page_bytes=16384", strings.Split(text, "\n")[1])
+	assert.Equal(t, tools.LogsPadding{Lines: 1}, read.Before)
+	assert.Equal(t, tools.LogsPadding{Span: "PT1S"}, read.After)
 }
 
-// A read past its own deadline answers timed-out itself, inside the loop's bound on
-// the call.
+// With until open and after set, the after padding starts at the first page's
+// clock, which the request line prints; no fixture line reaches it, so the page
+// says its padding is empty and marks nothing.
+func TestAnOpenUntilWithAfterPrintsWhereThePaddingStarts(t *testing.T) {
+	t.Parallel()
+	l := webappLogs(t, "m0", "m1", "m2")
+
+	text, read := readOf(t, l, webapp+`,"since":"2026-10-08T10:00:01Z","after":5}`)
+
+	lines := strings.Split(text, "\n")
+	resolved := logsinput.Stamp(read.ResolvedAt)
+	assert.Equal(t, "request: since=2026-10-08T10:00:01.000000000Z until=open resolved_at="+resolved+" before=0 after=5 page_from=last page_size=50 max_message_bytes=2048 max_page_bytes=16384", lines[1])
+	assert.Equal(t, "notice: empty-padding: no line is stamped at or past the first page's clock, where the padding after an open until starts", lines[3])
+	assert.Equal(t, []string{"m1", "m2"}, messagesOf(text))
+	assert.Equal(t, []tools.LogsNotice{{Code: "empty-padding", Message: "no line is stamped at or past the first page's clock, where the padding after an open until starts"}}, read.Notices)
+}
+
+// fetchFunc is a log service that answers each request as the func does.
+type fetchFunc func(q logs.FetchRequest) (logs.FetchResponse, error)
+
+func (f fetchFunc) Fetch(_ context.Context, _ cluster.ClusterID, q logs.FetchRequest) (logs.FetchResponse, error) {
+	return f(q)
+}
+
+// runOn calls the tool over the webapp mirror and fetch with raw.
+func runOn(t *testing.T, fetch fetchFunc, raw string) (string, bool, *tools.Action) {
+	t.Helper()
+	tool := New(logsinputtest.Watching(t), fetch)
+	tool.now = func() time.Time { return clock }
+	return tool.RunShown(t.Context(), tools.Runtime{ClusterID: "7"}, json.RawMessage(raw))
+}
+
+// echo answers a request with no lines and notices, echoing it.
+func echo(notices ...logs.Notice) fetchFunc {
+	return func(q logs.FetchRequest) (logs.FetchResponse, error) {
+		return logs.FetchResponse{Request: q, ResolvedAt: clock, Notices: append([]logs.Notice{}, notices...)}, nil
+	}
+}
+
+// Each notice is a line of its own, its message through ForModel, until they reach
+// logsinput.NoticesBudget; the rest are counted. A page can skip every one of MaxStreams.
+func TestNoticesStopAtTheirBudget(t *testing.T) {
+	t.Parallel()
+	var notices []logs.Notice
+	for i := range logs.MaxStreams {
+		notices = append(notices, logs.Notice{Code: refusal.CodeStreamSkipped, Message: fmt.Sprintf("prod/webapp-%d/app: the server refused to read its log \x1b[31msk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x1b[0m", i)})
+	}
+	text, isError, _ := runOn(t, echo(notices...), webapp+`}`)
+	require.False(t, isError, text)
+
+	lines := strings.Split(text, "\n")[3:]
+	shown := len(lines) - 1
+	assert.Less(t, shown, logs.MaxStreams)
+	assert.Equal(t, "notice: stream-skipped: prod/webapp-0/app: the server refused to read its log [redacted]", lines[0])
+	assert.Equal(t, fmt.Sprintf("notice: %d more notices left out", logs.MaxStreams-shown), lines[shown])
+	assert.LessOrEqual(t, len(strings.Join(lines[:shown], "\n")), logsinput.NoticesBudget)
+}
+
+// The notes on the sources stop at notesBudget, and the sources past it are
+// counted.
+func TestNotesStopAtTheirBudget(t *testing.T) {
+	t.Parallel()
+	var sources []string
+	for i := range 100 {
+		sources = append(sources, fmt.Sprintf(`{"namespace":"prod","resource":"pods/gone-%d"}`, i))
+	}
+	text, isError, _ := runOn(t, echo(), `{"sources":[`+strings.Join(sources, ",")+`]}`)
+	require.False(t, isError, text)
+
+	words := strings.Split(text, "\n")[0]
+	assert.True(t, strings.HasPrefix(words, "No lines of pods/gone-0 in prod and 99 more sources. pods/gone-0: default container."), words)
+	assert.Regexp(t, ` Notes on \d+ more sources left out\.$`, words)
+	assert.Less(t, len(words), notesBudget+200)
+}
+
+// The action is the window as the service ran it, the lines as the model read
+// them, whether the page had more either way, its notices, and the view around
+// its first line.
+func TestTheActionIsThePage(t *testing.T) {
+	t.Parallel()
+	l := webappLogs(t, "m0", "m1", "m2")
+
+	text, read := readOf(t, l, webapp+`,"grep":"m","since":"2026-10-08T10:00:00Z","until":"2026-10-08T10:00:02Z","page_size":2,"page_from":"first"}`)
+
+	since, until := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC), time.Date(2026, 10, 8, 10, 0, 2, 999999999, time.UTC)
+	first := logs.PageFromFirst
+	assert.Equal(t, "webapp", read.Sources[0].Name)
+	assert.Equal(t, "m", read.Grep)
+	assert.Equal(t, &since, read.Since)
+	assert.Equal(t, &until, read.Until)
+	assert.Equal(t, &first, read.PageFrom)
+	assert.False(t, read.OlderMore)
+	assert.True(t, read.NewerMore)
+	assert.Equal(t, []tools.LogsNotice{}, read.Notices)
+	lines := strings.Split(text, "\n")[3:]
+	require.Len(t, read.Lines, len(lines))
+	for i, line := range read.Lines {
+		assert.Equal(t, "prod", line.Namespace)
+		assert.Equal(t, "webapp-a", line.Pod)
+		assert.True(t, strings.HasSuffix(lines[i], " "+line.Message), lines[i])
+	}
+	require.NotNil(t, read.ViewAround)
+	assert.Equal(t, read.Lines[0].Timestamp, *read.ViewAround.Anchor.At)
+	assert.Equal(t, read.ResolvedAt, read.ViewAround.ResolvedAt)
+	assert.Equal(t, read.LogsScopeInput, read.ViewAround.LogsScopeInput)
+
+	_, read = readOf(t, l, webapp+`,"since":"2026-10-08T11:00:00Z"}`)
+	assert.Nil(t, read.ViewAround, "no line, no view")
+	assert.Nil(t, read.Until)
+}
+
+// A read past its deadline answers timed-out itself, inside the call's bound.
 func TestASlowReadTimesOut(t *testing.T) {
 	t.Parallel()
-	assert.Less(t, readTimeout, New(nil, nil, time.Now).CallTimeout(nil))
-	tool := New(logsinputtest.Watching(t), &fakeLogs{wait: true}, func() time.Time { return clock })
-	// The fetch waits out this deadline, so the test's wait is the read's own.
+	tool := New(logsinputtest.Watching(t), fetchFunc(nil))
+	tool.logs = blocking{}
 	tool.readTimeout = time.Millisecond
 	text, isError, shown := tool.RunShown(t.Context(), tools.Runtime{ClusterID: "7"}, json.RawMessage(webapp+`}`))
 	assert.True(t, isError)
 	assert.Nil(t, shown)
-	assert.JSONEq(t, `{"error":"timed-out"}`, text)
+	assert.Equal(t, `{"error":"timed-out"}`, text)
 }
 
-// View around this opens the read's view at its first line's moment, unpinned, in
-// either mode; a read of no line has none.
-func TestViewAroundIsTheViewAtTheFirstLine(t *testing.T) {
+// blocking is a log service whose fetch answers only once its context ends.
+type blocking struct{}
+
+func (blocking) Fetch(ctx context.Context, _ cluster.ClusterID, _ logs.FetchRequest) (logs.FetchResponse, error) {
+	<-ctx.Done()
+	return logs.FetchResponse{}, ctx.Err()
+}
+
+// A source the mirror refuses is refused before any read, with its code.
+func TestAMirrorRefusalReadsNothing(t *testing.T) {
 	t.Parallel()
-	a, b := record(time.Second, 0, "a"), record(2*time.Second, 0, "b")
-	for _, mode := range []string{"head", "tail"} {
-		_, read := readOf(t, &fakeLogs{page: logs.Page{Records: []logs.Record{a, b}}}, webapp+`,"grep":"a|b","mode":"`+mode+`"}`)
-		require.NotNil(t, read.ViewAround, mode)
-		assert.Equal(t, tools.LogsViewAction{
-			LogsViewInput: read.LogsViewInput,
-			Anchor:        tools.LogsViewAnchor{Kind: tools.LogsAnchorAt, At: &a.Timestamp},
-			ResolvedAt:    clock,
-		}, *read.ViewAround, mode)
-		assert.Equal(t, "a|b", read.ViewAround.Grep)
+	text, isError, _ := runOn(t, func(logs.FetchRequest) (logs.FetchResponse, error) {
+		t.Fatal("read past a refusal")
+		return logs.FetchResponse{}, nil
+	}, `{"sources":[{"namespace":"prod","resource":"pods/webapp-7f9c","containers":["nope"]}]}`)
+	assert.True(t, isError)
+	assert.Contains(t, text, `"error":"no-container"`)
+}
+
+// tokenOf is the token key a read's output prints, which must be set.
+func tokenOf(t *testing.T, text, key string) string {
+	t.Helper()
+	prev, next, follow := pageOf(t, text)
+	token := map[string]string{"prev": prev, "next": next, "follow": follow}[key]
+	require.NotEmpty(t, token, "%s in %s", key, strings.Split(text, "\n")[2])
+	return token
+}
+
+// A cut line is read whole by its printed timestamp in since and until with no
+// message cap, and the bytes cut say how much more that read brings.
+func TestACutLineIsReadWholeByItsStamp(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("y", 3000)
+	l := webappLogs(t, "m0", long, "m2")
+
+	text, _ := readOf(t, l, webapp+`,"since":"PT1H"}`)
+	line := strings.Split(text, "\n")[4]
+	assert.True(t, strings.HasSuffix(line, " … [952 bytes cut]"), line)
+	stamp := line[:strings.IndexByte(line, ' ')]
+
+	text, read := readOf(t, l, webapp+`,"since":"`+stamp+`","until":"`+stamp+`","max_message_bytes":0}`)
+	require.Len(t, read.Lines, 1)
+	assert.Equal(t, long, read.Lines[0].Message)
+	assert.Equal(t, 0, read.Lines[0].TruncatedBytes)
+	assert.NotContains(t, text, "bytes cut")
+}
+
+// A walk of a window three lines a page, each page from the printed next,
+// repeats and skips nothing.
+func TestAWalkByNextRepeatsAndSkipsNothing(t *testing.T) {
+	t.Parallel()
+	var msgs []string
+	for i := range 15 {
+		msgs = append(msgs, fmt.Sprintf("m%d", i))
 	}
+	l := webappLogs(t, msgs...)
+
+	text, _ := readOf(t, l, webapp+`,"since":"PT1H","until":"2026-10-08T10:00:14Z","page_size":3,"page_from":"first"}`)
+	read := messagesOf(text)
+	for range 4 {
+		text, _ = readOf(t, l, `{"cursor":"`+tokenOf(t, text, "next")+`","page_size":3}`)
+		read = append(read, messagesOf(text)...)
+	}
+	assert.Equal(t, msgs, read)
+	_, next, follow := pageOf(t, text)
+	assert.Empty(t, next+follow, "the window's last page")
 }
 
-func TestTheToolIsAShownBoundedRead(t *testing.T) {
+// The design's examples, each over the fixture.
+func TestTheDesignsExamples(t *testing.T) {
 	t.Parallel()
-	tool := New(nil, nil, time.Now)
-	def := tool.Definition()
-	assert.Equal(t, Name, def.Name)
-	assert.Equal(t, description, def.Description)
-	assert.JSONEq(t, string(inputSchema), string(def.InputSchema))
-	assert.Equal(t, tools.ActionLogsRead, tool.ActionKind())
-	assert.Equal(t, prompt, tool.Prompt())
-	_, err := tool.Action(json.RawMessage(webapp+`}`), "", false)
-	assert.ErrorIs(t, err, errNotShown)
-}
+	l := webappLogs(t, "m0", "m1", "m2", "m3", "m4", "m5", "m6")
+	stamp := func(s int) string { return fmt.Sprintf("2026-10-08T10:00:%02d.000000000Z", s) }
 
-// Run is RunShown with the action dropped, and the action carries the description.
-func TestRunAnswersTheSample(t *testing.T) {
-	t.Parallel()
-	_, _, shown := run(t, &fakeLogs{}, `{"description":"Why checkout failed","sources":[{"namespace":"prod","resource":"deployments/webapp"}]}`)
-	require.NotNil(t, shown)
-	assert.Equal(t, "Why checkout failed", shown.Description)
+	t.Run("a duration since, prev walked back", func(t *testing.T) {
+		text, _ := readOf(t, l, webapp+`,"since":"PT1H","page_size":3}`)
+		assert.Equal(t, []string{"m4", "m5", "m6"}, messagesOf(text))
+		text, _ = readOf(t, l, `{"cursor":"`+tokenOf(t, text, "prev")+`","page_size":3}`)
+		assert.Equal(t, []string{"m1", "m2", "m3"}, messagesOf(text))
+		text, _ = readOf(t, l, `{"cursor":"`+tokenOf(t, text, "prev")+`","page_size":3}`)
+		assert.Equal(t, []string{"m0"}, messagesOf(text))
+		prev, _, _ := pageOf(t, text)
+		assert.Empty(t, prev)
+	})
 
-	text, isError := New(logsinputtest.Watching(t), &fakeLogs{}, func() time.Time { return clock }).Run(t.Context(), tools.Runtime{ClusterID: "7"}, json.RawMessage(webapp+`}`))
-	assert.False(t, isError)
-	assert.True(t, strings.HasPrefix(text, "No lines of deployments/webapp in prod."), text)
+	t.Run("a moment padded by lines", func(t *testing.T) {
+		text, _ := readOf(t, l, webapp+`,"since":"`+stamp(3)+`","until":"`+stamp(3)+`","before":2,"after":2}`)
+		assert.Equal(t, []string{
+			stamp(1) + " prod/webapp-a/app [before] m1", stamp(2) + " prod/webapp-a/app [before] m2", stamp(3) + " prod/webapp-a/app m3",
+			stamp(4) + " prod/webapp-a/app [after] m4", stamp(5) + " prod/webapp-a/app [after] m5",
+		}, strings.Split(text, "\n")[3:])
+	})
+
+	t.Run("a range padded by spans, first through next", func(t *testing.T) {
+		text, _ := readOf(t, l, webapp+`,"since":"`+stamp(2)+`","until":"`+stamp(3)+`","before":"PT1S","after":"PT1S","page_from":"first","page_size":2}`)
+		assert.Equal(t, []string{stamp(1) + " prod/webapp-a/app [before] m1", stamp(2) + " prod/webapp-a/app m2"}, strings.Split(text, "\n")[3:])
+		text, _ = readOf(t, l, `{"cursor":"`+tokenOf(t, text, "next")+`","page_size":2}`)
+		assert.Equal(t, []string{stamp(3) + " prod/webapp-a/app m3", stamp(4) + " prod/webapp-a/app [after] m4"}, strings.Split(text, "\n")[3:])
+	})
+
+	t.Run("prev with a smaller page answers the same window", func(t *testing.T) {
+		first, _ := readOf(t, l, webapp+`,"since":"`+stamp(1)+`","until":"`+stamp(6)+`","page_size":4}`)
+		assert.Equal(t, []string{"m3", "m4", "m5", "m6"}, messagesOf(first))
+		text, _ := readOf(t, l, `{"cursor":"`+tokenOf(t, first, "prev")+`","page_size":1}`)
+		assert.Equal(t, []string{"m2"}, messagesOf(text))
+		window := func(text string) string {
+			fields := strings.Fields(strings.Split(text, "\n")[1])
+			return strings.Join(fields[1:5], " ")
+		}
+		assert.Equal(t, window(first), window(text))
+	})
+
+	t.Run("a duration since, then follow polled", func(t *testing.T) {
+		l := webappLogs(t, "m0", "m1")
+		text, _ := readOf(t, l, webapp+`,"since":"PT1H"}`)
+		assert.Equal(t, []string{"m0", "m1"}, messagesOf(text))
+		text, _ = readOf(t, l, `{"cursor":"`+tokenOf(t, text, "follow")+`"}`)
+		assert.True(t, strings.HasPrefix(text, "No lines of deployments/webapp in prod."), text)
+		l.Add("webapp-a", "app", logstest.Stamped(2*time.Second, "m2"))
+		text, _ = readOf(t, l, `{"cursor":"`+tokenOf(t, text, "follow")+`"}`)
+		assert.Equal(t, []string{"m2"}, messagesOf(text))
+	})
+
+	t.Run("an until at the call's moment prints no follow", func(t *testing.T) {
+		text, _ := readOf(t, l, webapp+`,"since":"PT1H","until":"`+clock.Format(time.RFC3339)+`"}`)
+		assert.Len(t, messagesOf(text), 7)
+		assert.Equal(t, "page: prev=none next=none follow=none", strings.Split(text, "\n")[2])
+	})
 }

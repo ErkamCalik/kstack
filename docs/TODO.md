@@ -120,21 +120,48 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 ## Sidecar (Go)
 
 - **Offer kubetail when a log stream stops at a limit.** A stream past the normal limits stops
-  with `failLimit` and is named in the page's `skipped` (→ [ADR: backward log reads assume normal
+  with `kubelet.FailLimit` and is named in a `stream-skipped` notice (→ [ADR: backward log reads assume normal
   logs](adr/2026-10-18-backward-reads-assume-normal-logs.md)). Kubetail, installed in the
   cluster, reads rotated files and greps on the node, so it can serve what the kubelet cannot.
   **Shape:** a second `Backend` after the kubelet, and an offer in the viewer next to the reason,
   which needs a limit told from a failure first.
 
-- **Revisit an opaque cursor for the log viewer's wire.** `logsFetch` and `logsFollow` hand the
-  webview a cursor as `cursorOf`'s tab-separated position, documented as opaque and passed back
-  unread. `LogsRead` gives the model the same position as base64url JSON
-  (`logsinput.EncodeCursor`), so the one position has two spellings. Decide whether
-  the wire should take the model's spelling, so the service has one encoder and the fields can
-  change without a client noticing the text. It is a wire-only change, since no client reads the
-  string, and it needs an ADR that updates
-  [a log cursor is a position](adr/2026-10-17-a-log-cursor-is-a-position.md), which names the
-  tab form.
+- **A long log line is cut at write time, and nothing says so.** `logline.KeepColor` (`logline/clean.go`) keeps
+  16 KiB of a message and appends an ellipsis; the file's `lines` row holds the cut text and
+  nothing else, so no reader can tell a cut line from one that ends in `…`. The cap stays: a line
+  is cluster text, and one line of many megabytes must not grow a buffer, a row or a page. Three
+  pieces, in order:
+  - **The kubelet fetcher should stop reading a long line, not skip past it.** `readLine`
+    (`kubelet/read.go`) keeps 64 KiB of a line and reads the rest of it off the wire to find its end,
+    so an attacker's line still costs its whole length in download. Stop at the cap, close the
+    read, and step forward to the next timestamp instead.
+  - **Record that a line was cut, as a boolean.** A `lines` column the writer sets when the cap
+    bit, the only fact the fetcher can know without reading the line whole. The readers (`Fetch`,
+    `Follow`, both tools, the viewer) surface it; the ellipsis leaves the stored text, since what
+    to draw is the reader's call. `docs/security-model.md` pins the cut with an ellipsis
+    (`TestStripControlCutsALongLine`); move that row in the same change. Until then `Fetch` and
+    `Follow` take the file's line as the whole message, and `TruncatedBytes` counts only the
+    request's cut.
+  - **A safe way to read the whole line.** A bounded read of one line from the kubelet on request,
+    streamed to the caller in parts under a byte budget, never held whole and never written to
+    the file.
+
+- **Bound a log scope's size, then cap the page cursor.** A scope's sources and filter values have
+  no size limit, and `MaxStreams` bounds the streams the mirror resolves, not the cached streams of
+  gone pods read beside them. So a page cursor, which carries the scope and an entry per container
+  passed, has no bound either, and `decodePageCursor` caps only its inflation. **Shape:** a
+  serialized scope budget and a total container limit, both checked before a page is served, so
+  the decoder can refuse an oversized token without ever refusing one the service wrote.
+
+- **Give a grep its context lines.** `Fetch` applies `Grep` to the range alone and leaves the
+  padding unfiltered (rule 11), so nothing shows the lines around each match. **Shape:** a
+  `Context{Before, After int}` beside `Grep`, refused without one; lines of the match's own
+  stream, attached to the match record rather than merged into `Records`, so `PageSize` still
+  counts matches and the cursors do not change; a line that is itself a match is never another
+  match's context; clipped to the window, capped, and counted against `MaxPageBytes`. The walk
+  already passes every line of a stream, so before-context is the last N lines per stream and
+  after-context is N more, with a short read past the cut for a page's last matches. Ship it on
+  `Fetch` first: on a follow, after-context means holding a match until N more lines arrive.
 
 - **A chat's directory layout is named in two packages.** agent/chat owns `<data>/chats/<id>`, but
   `tools` names two of its entries (`workspace/` in `WorkspacePath`, `results/` in `SaveTo`) while
@@ -597,11 +624,12 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 ## Frontend (webview)
 
-- **The log viewer's window is unbounded.** A long follow grows without end. Cap it at `maxLines`, dropping lines at the edge farther from the reader and never on screen; a dropped line comes back as a page from the sidecar's log cache, or from the kubelet once the cache has let it go. Its own pull request, over the working viewer.
-- **The log viewer shows only the filters the model set.** Kubetail's sidebar lists each region, zone, OS, architecture and node the open sources span, with a count per value. That needs one query answering what a view's sources resolved to, which the sidecar's resolve already computes (`services/logs/sources.go`) and the wire does not carry.
-- **The inline card reads an `At` window as an `Around` page and keeps its head half.** The tail
-  half is a backward read for lines nobody uses. `services/logs` can read a `Head` page from a
-  moment; `src/lib/inline-log-lines.ts` should ask for that instead.
+- **Bound the viewer's window and re-fetch from its edge page cursors.** A long follow grows the window's lines without end. Cap it at `maxLines`, dropping lines at the edge farther from the reader and never on screen, and keep that edge's page cursor, so scrolling back is an ordinary `Continue`. A dropped line comes back from the sidecar's log cache, or from the kubelet once the cache has let it go. The cost is the library's stable-key rule across a drop.
+- **The log viewer shows only the filters the model set.** Kubetail's sidebar lists each region, zone, OS, architecture and node the open sources span, with a count per value. That needs one query answering what a view's sources resolved to, which the sidecar's resolve already computes (`services/logs/resolve.go`) and the wire does not carry.
+- **The inline card reads an `At` window and keeps one half.** `src/lib/inline-log-lines.ts` asks
+  for both halves of the moment and drops the other, a read for lines nobody uses. The service
+  reads either half as one first page (a window since the moment from `First`, or until it from
+  `Last`); the library's query union has no kind that asks for one half alone.
 - **Read on through empty log pages.** A grep with no match across many logs returns several empty
   pages in a row, each cut at the page's limits (→ [ADR: backward log reads assume normal
   logs](adr/2026-10-18-backward-reads-assume-normal-logs.md)), and the viewer shows *Keep looking* after each. It could read on by itself a few
@@ -609,11 +637,11 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 - **The log viewer cannot say how far a search has got.** *"Searched back to 09:14, no matches
   yet."* The webview never reads a cursor, so a page needs to carry a moment: a small wire change.
 - **The log viewer cannot tell a limit from a failure.** A stream stopped at a second too loud to
-  read (`failLimit`) and one whose read failed both arrive in `skipped`. Telling them apart lets the
+  read (`FailLimit`) and one whose read failed both arrive as a `stream-skipped` notice. Telling them apart lets the
   kubetail offer sit next to the reason.
-- **The log viewer has no download, ANSI colours or timezone setting.** Colours mean drawing escape sequences the sidecar now strips, so they need a security decision first.
+- **The log viewer has no download or timezone setting.**
 - **The log file's budget has no setting.** Each cluster cache's log file holds up to 1 GiB (`logstore.DefaultRetention.Bytes`), with SQLite's index and WAL on top, so a user with several clusters can use several GiB of disk. **Trigger:** a user asking to keep less. **Shape:** a setting read where `logs.New` takes its `Retention`.
-- **The log viewer draws no notice at a stream's start when the kubelet rotated the start away.** A hole between two known lines is exact: the kubelet returns the line before the hole when it still has it, and a later first line when it does not (→ [ADR: a head read never links](adr/2026-10-17-a-head-read-never-links.md)). The start of a stream has no line before it, so a quiet start and a rotated one look the same. A guess from `started_at` ("the container started well before its oldest line") would mark nearly every log, since most containers boot for seconds to minutes before their first line. **Shape:** a stronger signal than time alone, such as the stream's bytes read from its head being near the kubelet's rotation size, or an archive backend that answers the question properly. **Trigger:** a user reading a busy container's rotated start as its real start.
+- **The log viewer draws no notice at a stream's start when the kubelet rotated the start away.** A hole between two known lines is exact: the kubelet returns the line before the hole when it still has it, and a later first line when it does not (→ [ADR: a head read never links](adr/2026-10-17-a-head-read-never-links.md)). The start of a stream has no line before it, so a quiet start and a rotated one look the same. A guess from `started_at` ("the container started well before its oldest line") would mark nearly every log, since most containers boot for seconds to minutes before their first line. **Shape:** a stronger signal than time alone, such as the stream's bytes read from its beginning being near the kubelet's rotation size, or an archive backend that answers the question properly. **Trigger:** a user reading a busy container's rotated start as its real start.
 
 - **The omnibox's TLS badge misses a schemeless server.** `tlsUnverifiedReason` (`src/lib/kube-config.tsx`)
   reads the entry's `server` for an `http://` prefix, but client-go defaults a schemeless server

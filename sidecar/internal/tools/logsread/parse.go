@@ -16,51 +16,43 @@ package logsread
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/kstackhq/kstack/sidecar/internal/tools"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/internal/logsinput"
 )
 
-// The lines a read returns: at most maxLimit, defaultLimit when the call names none.
+// A page's lines: at most maxPageSize, defaultPageSize when the call names none.
 const (
-	maxLimit     = 100
-	defaultLimit = 50
+	maxPageSize     = 100
+	defaultPageSize = 50
 )
 
-// endMessage is the refusal of a since or until the tool cannot read on the clock
-// now, which it names so the retry can be exact.
-func endMessage(now time.Time) string {
-	return "an RFC 3339 time, an ISO 8601 duration back from now such as PT15M, or a cursor a read printed; now is " + now.UTC().Format(time.RFC3339)
-}
+// momentForms is what since and until take, which a refusal names with the clock.
+const momentForms = "an RFC 3339 time at any precision, or an ISO 8601 duration back from now such as PT15M"
 
-// input is one call's arguments: the view's, the range's ends, nil for an open
-// end, the mode and the limit.
+// input is one call's arguments: the scope's, the window and the end the first
+// page comes from, or the cursor a read printed, nil for none; and the caps every
+// page names.
 type input struct {
 	logsinput.Input
-	since, until *end
-	mode         tools.LogsReadMode
-	limit        int
+	window   logs.Window
+	pageFrom logs.PageFrom
+	cursor   *string
+
+	pageSize, maxMessageBytes, maxPageBytes int
 }
 
-// end is one end of a read's range: the service's cursor for it, the moment the
-// action records, and whether it names a line, which is outside the range, rather
-// than a moment, whose lines are in it.
-type end struct {
-	cursor string
-	at     time.Time
-	line   bool
-}
-
-// parse reads the call's arguments, the shared ones through logsinput, and resolves
-// each end of the range on the clock now.
+// parse reads the call's arguments, the shared ones through logsinput, and reads
+// the range's ends on the clock now.
 func parse(raw json.RawMessage, now time.Time) (input, error) {
-	in := input{mode: tools.LogsReadHead, limit: defaultLimit}
-	var since, until, mode string
+	in := input{pageSize: defaultPageSize, maxMessageBytes: logsinput.DefaultMessageBytes, maxPageBytes: logsinput.SampleBudget}
+	var since, until, pageFrom, cursor string
 	shared, err := logsinput.Parse(raw, logsinput.Fields{
-		"since": &since, "until": &until, "mode": &mode, "limit": &in.limit,
+		"since": &since, "until": &until, "before": &in.window.Before, "after": &in.window.After,
+		"page_from": &pageFrom, "page_size": &in.pageSize, "max_message_bytes": &in.maxMessageBytes,
+		"max_page_bytes": &in.maxPageBytes, "cursor": &cursor,
 		"anchor":     logsinput.BadInput("anchor", "a read takes since and until"),
 		"pin_to_end": logsinput.BadInput("pin_to_end", "a read opens no viewer"),
 	})
@@ -68,44 +60,62 @@ func parse(raw json.RawMessage, now time.Time) (input, error) {
 		return input{}, err
 	}
 	in.Input = shared
-	if in.limit < 1 || in.limit > maxLimit {
-		return input{}, logsinput.BadInput("limit", fmt.Sprintf("1 to %d", maxLimit))
+	switch {
+	case in.pageSize < 1 || in.pageSize > maxPageSize:
+		return input{}, logsinput.BadInput("page_size", fmt.Sprintf("1 to %d", maxPageSize))
+	case in.maxPageBytes < 1 || in.maxPageBytes > logsinput.SampleBudget:
+		return input{}, logsinput.BadInput("max_page_bytes", fmt.Sprintf("1 to %d", logsinput.SampleBudget))
 	}
-	switch mode {
-	case "", "head":
-	case "tail":
-		in.mode = tools.LogsReadTail
+	if err := logsinput.CheckMessageBytes(in.maxMessageBytes); err != nil {
+		return input{}, err
+	}
+	if cursor != "" {
+		if in.NamesScope() || since != "" || until != "" || in.window != (logs.Window{}) || pageFrom != "" {
+			return input{}, logsinput.BadInput("cursor", "a token already names the sources, filters, grep, range, padding and page_from: send it with page_size, max_message_bytes and max_page_bytes alone")
+		}
+		in.cursor = &cursor
+		return in, nil
+	}
+	if len(in.Sources) == 0 {
+		return input{}, logsinput.BadInput("sources", "name sources, or a cursor a read printed")
+	}
+	switch pageFrom {
+	case "", "last":
+		in.pageFrom = logs.PageFromLast
+	case "first":
+		in.pageFrom = logs.PageFromFirst
 	default:
-		return input{}, logsinput.BadInput("mode", "head or tail")
+		return input{}, logsinput.BadInput("page_from", "first or last")
 	}
-	if in.since, err = endOf(since, now, "since"); err != nil {
+	if in.window.Since, err = momentOf(since, now, logsinput.Since, "since"); err != nil {
 		return input{}, err
 	}
-	if in.until, err = endOf(until, now, "until"); err != nil {
+	if in.window.Until, err = momentOf(until, now, logsinput.Until, "until"); err != nil {
 		return input{}, err
-	}
-	if in.since != nil && in.until != nil && in.since.at.After(in.until.at) {
-		return input{}, logsinput.BadInput("until", "not before since")
 	}
 	return in, nil
 }
 
-// endOf is the end s names on the clock now, nil for none: a moment, a duration
-// back from now, or a cursor a read printed. A cursor is base64url JSON, starting
-// eyJ, so it never reads as a duration.
-func endOf(s string, now time.Time, field string) (*end, error) {
+// momentOf is the end of the range s names on the clock now, nil for none.
+func momentOf(s string, now time.Time, end logsinput.End, field string) (*time.Time, error) {
 	if s == "" {
 		return nil, nil
 	}
-	if at, ok := logsinput.MomentOf(s, now, logsinput.Behind); ok {
-		return &end{cursor: at.Format(time.RFC3339Nano), at: at}, nil
-	}
-	c, at, err := logsinput.DecodeCursor(s)
-	if errors.Is(err, logsinput.ErrOldCursor) {
-		return nil, logsinput.BadInput(field, logsinput.OldCursorMessage)
-	}
+	at, err := logsinput.MomentOf(s, now, end, logsinput.Behind)
 	if err != nil {
-		return nil, logsinput.BadInput(field, endMessage(now))
+		return nil, logsinput.BadInput(field, logsinput.MomentMessage(err, momentForms, now))
 	}
-	return &end{cursor: c, at: at, line: true}, nil
+	return &at, nil
+}
+
+// request is the page the call reads: a first page of the scope view resolved
+// to, or the cursor alone, each with the caps and for the model.
+func (in input) request(view logs.Scope) logs.FetchRequest {
+	q := logs.FetchRequest{PageSize: in.pageSize, MaxMessageBytes: in.maxMessageBytes, MaxPageBytes: in.maxPageBytes, ForModel: true}
+	if in.cursor != nil {
+		q.Cursor = in.cursor
+		return q
+	}
+	q.Scope, q.Window, q.PageFrom = view, in.window, in.pageFrom
+	return q
 }

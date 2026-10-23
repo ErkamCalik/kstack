@@ -45,7 +45,8 @@ session.
 - **`ActionAsker`** puts a sandboxed command's classified `ActionRequest` to the user, or
   `Record`s one decided unasked. Nil where nobody can be asked.
 - **A tool that acts through a service is built with it** (`memory.New`, `kubequery.New`,
-  `logsview.New`, `logsread.New`, `logswatch.New`, in `app`'s `chatTools`) and maps the service's errors to the model's codes →
+  `logsview.New`, `logsread.New` and `logswatch.New` over the log service too, in `app`'s
+  `chatTools`) and maps the service's errors to the model's codes →
   [ADR](../../../docs/adr/2026-09-27-a-tool-calls-its-service-directly.md).
 - `InlineLimit` (30,000) caps a result; `FileLimit` (8 MiB) caps saved output and Read.
 - **The chat's `defaultToolTimeout` is 2 s.** A tool that does I/O is `Bounded` and names its own
@@ -115,11 +116,11 @@ whose SDK it imports.
 
 **LogsView is a live view of logs the user looks at, opened by the model's call.** It is `Custom` and `Shown`, never `Gated`, and reads no log line: it checks the call
 against the mirror, hands back a `LogsViewAction` the row keeps, and answers a one-line receipt
-through `safe.Redact`. The action embeds `LogsViewInput` (`services/logs`' `View`, aliased in
+through `safe.Redact`. The action embeds `LogsScopeInput` (`services/logs`' `Scope`, aliased in
 `tools`) plus an `Anchor`, `PinToEnd` and `ResolvedAt`, the moment it resolved on the tool's clock, which a frozen card reads up to; the enums bind member by member in `gqlgen.yml`.
-It reads its own `anchor` and `pin_to_end` as `logsinput.Parse`'s `Fields`, then resolves the
-view with `logsinput.Resolve`. **A source the mirror does not hold yet opens**: a view waits for it.
-A refusal is one JSON line with a code, never the model's text. It is in `catalog`'s `ours` and
+It reads its own `anchor` and `pin_to_end` as `logsinput.Parse`'s `Fields`, refuses a call with
+no sources, then resolves the view with `logsinput.Resolve`; its clock is a field its tests set.
+**A source the mirror does not hold yet opens**: a view waits for it. A refusal is one JSON line with a code, never the model's text. It is in `catalog`'s `ours` and
 `app.go`'s box, and out of `SubagentBox` and `MonitorBox`: a view is the user's window. The model
 reads lines through `LogsRead`, and those the user selects and sends ride the question's View
 section (`internal/agent/CLAUDE.md`). The service it checks against is
@@ -127,77 +128,62 @@ section (`internal/agent/CLAUDE.md`). The service it checks against is
 
 ## LogsRead (`tools/logsread`)
 
-**LogsRead is the model's read of a range of logs.** It is `Custom`, `Shown` and `Bounded` (30 s),
-never `Gated`. `parse.go` takes the shared keys through `logsinput.Parse` and its own `since`,
-`until` (each a moment, a duration back from now or a printed cursor), `mode` (`head`, `tail`) and `limit`
-(1–100, 50), refusing `anchor` and `pin_to_end` by name. `RunShown` resolves the view as LogsView
-does, then reads one page with `logs.Service.Fetch` (the `Fetcher` field, faked in tests) under its
-own `readTimeout` (25 s), so a slow read answers `timed-out` itself. A service `Refusal` answers
-`refused` with its words through `logs.ForModel`; any other failure is `read-failed`.
+**LogsRead is the model's read of a window of logs, a page at a time.** It is `Custom`, `Shown` and
+`Bounded` (30 s; the page's own deadline is 25 s, past which it answers `timed-out`), never
+`Gated`, in `catalog`'s `ours`, `app.go`'s box after LogsView, and in `SubagentBox` and
+`MonitorBox`. `New(svc, logs)` takes the cluster service and the log service's `Fetch`; its clock
+is a field its tests set. A first page resolves its scope through `logsinput.Resolve` and sends
+the window (`since`, `until`, `before`, `after`) and `page_from`; a `cursor` call sends the token
+and the caps alone, since the token holds the scope as the read that printed it resolved it, and
+names no sources, filters, grep, window or `page_from`. **Every page is asked with `ForModel`**, so
+the service redacts each message before it cuts it. The sample's header is the read in words
+(notes up to 4 KiB), the `request:` line (the request as the service echoed it, `resolved_at`
+beside an open `until` with `after` set), the `page:` line (`prev`, `next` and `follow`, each
+`none` or a token printed whole after the redaction), then the notices
+(`logsinput.Notices`). A record outside the range is marked `[before]` or `[after]`
+(`logsinput.PlaceOf`). The widest page passes `tools.InlineLimit` and is saved to a file, as any
+tool's oversized result. Its action, `LogsReadAction`, holds the window as it ran, the lines the
+model read and whether the page had more each way, with `viewAround`, the scope's view at its
+first line's moment, unpinned.
 
-- **`sample.go` is what the model reads.** Each message goes through `logs.ForModel`, then is cut
-  at 2 KiB (`logsinput.CutLine`). The lines are at most 16 KiB, kept from the end the read started at; the header names
-  skipped streams up to 2 KiB and notes up to 4 KiB. So the output fits `tools.InlineLimit` and is never
-  saved (`TestNoOutputPassesTheInlineLimit`). A record's line starts with its timestamp, a hole's
-  with `[`, and the header is the sidecar's.
-- **Each edge is `End`, `More` or `Unread`.** A printed cursor's side is `More`, a moment's
-  `Unread`; an end the page or the budget cut is `More`.
-- **The cursor the model sees is opaque** (`logsinput.EncodeCursor`): the line's position as JSON,
-  base64url, turned into the service's own through `logs.LineCursor`. The header prints it after
-  `safe.Redact`, never through it.
-- **The action holds the lines the model read**, with `viewAround`, the read's view at its first
-  line's moment, unpinned. It is in `catalog`'s `ours`, `app.go`'s box after LogsView, and in
-  `SubagentBox` and `MonitorBox`.
-
-→ [the model reads logs](../../../docs/security/2026-10-17-the-model-reads-logs.md).
+→ [ADR: a log read is a window over a range](../../../docs/adr/2026-10-23-a-log-read-is-a-window-over-a-range.md), [the model reads logs](../../../docs/security/2026-10-17-the-model-reads-logs.md).
 
 ## LogsWatch (`tools/logswatch`)
 
-**LogsWatch is a follow of a view that runs as a background task and wakes the model once, when it
-ends.** It is `Custom`, `Shown` and `Bounded` (30 s), never `Gated`. `parse.go` takes the shared
-keys through `logsinput.Parse` and its own `since` (a moment or a duration back, not after now, or
-a printed cursor), `until` (a moment or a duration ahead, after now, cut to `maxWatch`, a day),
-`limit` (1–100, 1) and `max_bytes` (1–16 KiB, 16 KiB), refusing `anchor`, `pin_to_end` and `mode`
-by name. `RunShown` resolves the view as LogsView does, then opens `logs.Service.Follow` (the
-`Follower` field) **on a context of the watch's own**, `WithDeadline(WithoutCancel(ctx), until)`,
-from a cursor's line or a moment less a nanosecond, the tool's `now` with none, so the follow
-starts where the window says and not after its own setup; then hands it to `rt.Watches.Start`. A
-start refused cancels it. Until `Follow` returns the call's end still cancels it (`context.AfterFunc`),
-so a stalled open never outlives the call's bound. The receipt goes through `safe.Redact`; the action is a `LogsWatchAction`.
-
-- **`watch.go` is the `tools.Watch`.** `Wait` reads the frames: a line through `logs.ForModel`, cut
-  at 2 KiB, until the lines reach `limit` or their size `max_bytes`, which cancels the follow; an
-  `Ended` frame's reason is kept. **The lines are sorted by `logs.CompareLines` once the follow is done**,
-  since a follow orders them per container only. **A cancelled follow closes with no frame and no error**, so
-  `End(stoppedBy)` decides in order: a fill, the follow's reason or an error (matched with lines,
-  failed without; an error's text never), the deadline off the context's error (matched or
-  expired), else a stop, read last so one that lands during the drain relabels nothing.
-- **The result is a `LogsRead` sample** (`tools.WatchResult`): a header naming the window and why it
-  ended, the cursors to read around the first and last line after the redaction, then the lines;
-  with the lines as the action keeps them and the `viewAround` at the first. It fits
-  `tools.InlineLimit` (`TestNoSamplePassesTheInlineLimit`).
-- It is in `catalog`'s `ours`, `app.go`'s box after LogsRead, and out of `SubagentBox` and
-  `MonitorBox`: a watch's point is the turn it starts.
+**LogsWatch is a follow of a scope that runs as a background task and wakes the model once, when it
+ends.** It is `Custom`, `Shown` and `Bounded` (30 s), never `Gated`, in `catalog`'s `ours`,
+`app.go`'s box after LogsRead, and out of `SubagentBox` and `MonitorBox`: a watch's point is the
+turn it starts. `New(svc, logs)` takes the cluster service and the log service's `Follow`. A watch
+starts now, at `since`, or from a read's `next` or `follow` token in `cursor`, which holds the
+scope; the follow opens with `ForModel` under a context whose deadline is `until` (a day at most),
+free of the call's once open. The receipt, the action and the view around the lines take the
+scope the follow echoes. **The watch** (`watch.go`) holds each line as the service cut it until
+`limit` or `max_bytes`, keeps notices through `logsinput.Notices`, which counts those past its
+budget, and reads an `Ended` frame as why it ended; its header prints no cursor. Its action is a
+`LogsWatchAction`; the chat holds a watch as a background task (`internal/agent/CLAUDE.md`).
 
 → [the model watches logs](../../../docs/security/2026-10-18-the-model-watches-logs.md).
 
 ## The log tools' input (`tools/internal/logsinput`)
 
-**`tools/internal/logsinput` is what LogsView, LogsRead and LogsWatch share.** `Parse(raw, own)` is the
+**`tools/internal/logsinput` is what the three log tools share.** `Parse(raw, own)` is the
 strict walk (each key once, DNS names, at most 100 sources, `grep` compiled on one line of at most
-`MaxGrep`); `own` is the tool's `Fields`, each key's typed destination or the refusal it earns.
-`Resolve(ctx, svc, now, id, in)` checks each source inside one `ReadActive`, then runs
-`logs.Check`, so a view a tool takes is one the service reads. `MomentOf(s, now, dir)` reads an RFC 3339
-time or an ISO 8601 duration, applied on the calendar in UTC in the caller's `Direction` (`Behind`
-or `Ahead`), a month end clamped to the target month's last day, and nothing before the epoch or
-after 9999; `SourcesText` and `NotesText` how a tool names its sources; `Refusal` and `Result` how it
-answers. `cursor.go` is the opaque cursor a sample prints and a call reads back (`EncodeCursor`,
-`DecodeCursor`). **It carries `cursorVersion`**: a cursor lives on in transcripts no build can
-rewrite, so a change to its shape or a field's meaning bumps the version, and a cursor from another
-version is refused with `OldCursorMessage`, which tells the model to read again (`ErrOldCursor`); `sample.go` how a line reads (`LineText`, `CutLine`, `Stamp`, the caps
-`MaxSampleLine` and `SampleBudget`), how an action keeps it (`ReadLine`) and the view around it
-(`ViewAround`). `logsinputtest` is the fake cluster and
-the fixtures both tools' tests run over (`cluster/clustertest` beneath).
+`MaxGrep`); `own` is the tool's `Fields`, each key's typed destination (`*string`, `*bool`, `*int`
+or `*logs.Padding`, lines or a span under the service's caps) or the refusal it earns. It takes a
+call with no sources: each tool says whether it needs them. `Resolve(ctx, svc, now, id, in)` checks
+each source inside one `ReadActive`, then runs `logs.Check`, so a scope a tool takes is one the
+service reads. `MomentOf(s, now, end, dir)` reads an RFC 3339 time at any precision as the
+interval it spells, `Since` its first nanosecond and `Until` its last (a date is UTC and takes no
+offset), or an ISO 8601 duration (read by `services/logs/iso8601`), exact, applied on the calendar
+in UTC in the caller's `Direction` (`Behind` or `Ahead`), a month end clamped to the target
+month's last day, and nothing before the epoch or after 9999; `MomentMessage` words its refusal.
+`SourcesText`, `SourcesOf` and `NotesText` are how a tool names its sources; `Refusal` and `Result`
+how it answers, a service refusal by its own code. `sample.go` is how a line reads (`LineText`,
+with a place mark and the bytes cut; `Stamp`, nine fraction digits always; `PlaceOf`), a header's
+notices (`Notices`, under `NoticesBudget`), the caps `DefaultMessageBytes` and `SampleBudget`,
+how an action keeps a line (`ReadLine`) and the view around it (`ViewAround`). `logsinputtest` is
+the fake cluster and the fixtures the tools' tests run over (`cluster/clustertest` beneath), and
+`Logs`, a real log service over a fake API server whose lines sit at a fixed moment in the past.
 
 ## KubeQuery (`tools/kubequery`)
 

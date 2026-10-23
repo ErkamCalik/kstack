@@ -298,7 +298,7 @@ type toolDeps struct {
 	umask    fs.FileMode
 	memory   memory.Service
 	clusters cluster.Service
-	// logs is the log service LogsRead reads and LogsWatch follows through.
+	// logs is what LogsRead pages and LogsWatch follows.
 	logs *logs.Service
 	// now is the clock the search's prompt names the month by; nil is time.Now.
 	now func() time.Time
@@ -337,9 +337,9 @@ func chatTools(d toolDeps) (tools.Box, error) {
 	search := anthropicwebsearch.New(now)
 	notes := memorytool.New(d.memory)
 	query := kubequery.New(d.clusters)
-	views := logsview.New(d.clusters, now)
-	reads := logsread.New(d.clusters, d.logs, now)
-	watches := logswatch.New(d.clusters, d.logs, now)
+	views := logsview.New(d.clusters)
+	reads := logsread.New(d.clusters, d.logs)
+	watches := logswatch.New(d.clusters, d.logs)
 	if d.shell == nil {
 		return tools.NewBox([]tools.Tool{reader, notes, writer, editor, fetcher, taskstop.New(), agent.New(), search, query, views, reads, watches}, bash.Reader{}), nil
 	}

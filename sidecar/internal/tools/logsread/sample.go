@@ -16,113 +16,58 @@ package logsread
 
 import (
 	"fmt"
-	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kstackhq/kstack/sidecar/internal/lib/safe"
 	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/iso8601"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/logline"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/internal/logsinput"
 )
 
-// A header's caps, in bytes: its notes and its skipped streams. With the lines'
-// logsinput.SampleBudget and the header's fixed part they keep the output under
-// tools.InlineLimit, so it is never saved to a file.
-const (
-	notesBudget   = 4 << 10
-	skippedBudget = 2 << 10
-)
+// notesBudget is the most bytes of notes on the sources a header prints.
+const notesBudget = 4 << 10
 
-// sample is a page as the model reads it: the records kept, oldest first, their
-// messages stripped, redacted and cut; the records the budget dropped; what lies
-// past each end; the cursor to read on from, "" for none; and each stream the page
-// could not read.
+// sample is a page as the model reads it: the response and its records, each
+// message through logline.ForModel. The service ran it already and it changes
+// nothing run again; it stays the one gate a line reaches the model through.
 type sample struct {
-	records       []logs.Record
-	dropped       int
-	before, after tools.LogsReadEdge
-	next          string
-	skipped       []string
+	resp    logs.FetchResponse
+	records []logline.Record
 }
 
-// sampleOf is in's page as a sample. The budget keeps lines from the end the read
-// started at, so a head read drops its newest lines and a tail read its oldest, and
-// the end that lost lines has more past it.
-func sampleOf(in input, page logs.Page) sample {
-	tail := in.mode == tools.LogsReadTail
-	// In the order read: the records, the ends, and whether the page left more past
-	// the far end.
-	recs, near, far, more := page.Records, in.since, in.until, page.After.More
-	if tail {
-		recs, near, far, more = reversed(recs), in.until, in.since, page.Before.More
-	}
-	kept := fit(recs)
-	dropped := len(recs) - len(kept)
-	more = more || dropped > 0
-	s := sample{records: kept, dropped: dropped, before: edge(near, false), after: edge(far, more), skipped: []string{}}
-	if more && len(kept) > 0 {
-		s.next = logsinput.EncodeCursor(kept[len(kept)-1])
-	}
-	if tail {
-		s.records = reversed(kept)
-		s.before, s.after = s.after, s.before
-	}
-	for _, line := range page.Skipped {
-		s.skipped = append(s.skipped, logs.ForModel(line))
+func sampleOf(resp logs.FetchResponse) sample {
+	s := sample{resp: resp, records: make([]logline.Record, len(resp.Records))}
+	for i, rec := range resp.Records {
+		rec.Message = logline.ForModel(rec.Message)
+		s.records[i] = rec
 	}
 	return s
 }
 
-// fit is the longest prefix of recs whose lines fit logsinput.SampleBudget, each message
-// through logs.ForModel and then cut, since redaction reads the whole message.
-func fit(recs []logs.Record) []logs.Record {
-	var kept []logs.Record
-	size := 0
-	for _, rec := range recs {
-		rec.Message = logsinput.CutLine(logs.ForModel(rec.Message))
-		if size += len(logsinput.LineText(rec)) + 1; size > logsinput.SampleBudget {
-			break
-		}
-		kept = append(kept, rec)
-	}
-	return kept
-}
-
-func reversed(recs []logs.Record) []logs.Record {
-	out := slices.Clone(recs)
-	slices.Reverse(out)
-	return out
-}
-
-// edge is what lies past one end of the sample: more when the page or the budget
-// left lines that way, or when the end is a printed cursor, whose lines the model
-// read already; unread past a moment the read stopped at; nothing past an open end
-// it reached.
-func edge(e *end, more bool) tools.LogsReadEdge {
-	switch {
-	case more, e != nil && e.line:
-		return tools.LogsReadMore
-	case e != nil:
-		return tools.LogsReadUnread
-	}
-	return tools.LogsReadEnd
-}
-
-// output is the sample as the model reads it: the header, then its lines.
-func (s sample) output(in input, notes []logsinput.Note, view tools.LogsViewAction) string {
-	lines := []string{s.header(in, notes, view)}
+// output is the sample as the model reads it: the header, then one line per
+// record, each marked with its place in the window.
+func (s sample) output(in input, notes []logsinput.Note) string {
+	lines := []string{s.header(in, notes)}
 	for _, rec := range s.records {
-		lines = append(lines, logsinput.LineText(rec))
+		lines = append(lines, logsinput.LineText(rec, logsinput.PlaceOf(rec, s.resp)))
 	}
 	return strings.Join(lines, "\n")
 }
 
-// header is the line before the sample: what was read, over what range and which
-// end of it, the grep, each source's notes, the streams skipped and the lines
-// dropped, then each edge, the one the read moved toward last. It is cluster text,
-// redacted as the receipt is; the cursor to read on from goes after the redaction,
-// which could change it.
-func (s sample) header(in input, notes []logsinput.Note, view tools.LogsViewAction) string {
+// header is the lines before the records: the read in words, the request as it
+// ran, the page's tokens, and its notices. The words and the notices are cluster
+// text, redacted as a receipt is; the tokens go after the redaction, which could
+// change them.
+func (s sample) header(in input, notes []logsinput.Note) string {
+	scope := s.resp.Request.Scope
+	typed := in.Sources
+	if in.cursor != nil {
+		typed = logsinput.SourcesOf(scope.Sources)
+	}
 	var b strings.Builder
 	switch n := len(s.records); n {
 	case 0:
@@ -132,80 +77,18 @@ func (s sample) header(in input, notes []logsinput.Note, view tools.LogsViewActi
 	default:
 		fmt.Fprintf(&b, "Read %d lines of ", n)
 	}
-	b.WriteString(logsinput.SourcesText(in.Sources) + rangeText(in.since, in.until))
-	switch {
-	case len(s.records) == 0:
-	case in.mode == tools.LogsReadHead:
-		b.WriteString(", oldest first")
-	default:
-		b.WriteString(", the newest")
-	}
-	if in.Grep != "" {
-		b.WriteString(", matching /" + in.Grep + "/")
+	b.WriteString(logsinput.SourcesText(typed))
+	if scope.Grep != "" {
+		b.WriteString(", matching /" + scope.Grep + "/")
 	}
 	b.WriteString(".")
-	b.WriteString(notesText(in.Sources, view.Sources, notes))
-	b.WriteString(skippedText(s.skipped))
-	switch {
-	case s.dropped == 1:
-		b.WriteString(" 1 more line was left out to fit.")
-	case s.dropped > 1:
-		fmt.Fprintf(&b, " %d more lines were left out to fit.", s.dropped)
+	b.WriteString(notesText(typed, scope.Sources, notes))
+	lines := []string{safe.Redact(b.String()), s.requestText(), s.pageText()}
+	var notices logsinput.Notices
+	for _, n := range s.resp.Notices {
+		notices.Add(n)
 	}
-	older := edgeText(s.before, " Older lines exist", " Older lines may exist")
-	newer := edgeText(s.after, " More lines follow", " Newer lines may exist")
-	near, far, field := older, newer, "since"
-	if in.mode == tools.LogsReadTail {
-		near, far, field = newer, older, "until"
-	}
-	if near != "" {
-		b.WriteString(near + ".")
-	}
-	b.WriteString(far)
-	text := safe.Redact(b.String())
-	switch {
-	case s.next != "":
-		return text + "; to read on, " + field + ": " + s.next
-	case far != "":
-		return text + "."
-	}
-	return text
-}
-
-// edgeText is what the header says of an edge: more for More, maybe for Unread,
-// nothing for End.
-func edgeText(e tools.LogsReadEdge, more, maybe string) string {
-	switch e {
-	case tools.LogsReadMore:
-		return more
-	case tools.LogsReadUnread:
-		return maybe
-	}
-	return ""
-}
-
-// rangeText is the range as the header names it: a moment's lines are in it, a
-// printed cursor's line is not.
-func rangeText(since, until *end) string {
-	if since != nil && until != nil && !since.line && !until.line {
-		return " between " + logsinput.Stamp(since.at) + " and " + logsinput.Stamp(until.at)
-	}
-	var out string
-	if since != nil {
-		word := " from "
-		if since.line {
-			word = " after "
-		}
-		out += word + logsinput.Stamp(since.at)
-	}
-	if until != nil {
-		word := " up to "
-		if until.line {
-			word = " before "
-		}
-		out += word + logsinput.Stamp(until.at)
-	}
-	return out
+	return strings.Join(append(lines, notices.Lines()...), "\n")
 }
 
 // notesText is what the header says of each source beyond its name, up to
@@ -222,47 +105,72 @@ func notesText(typed []logsinput.Source, sources []tools.LogsViewSource, notes [
 	return b.String()
 }
 
-// skippedText names each stream the read could not read, up to skippedBudget; the
-// streams past it are counted.
-func skippedText(skipped []string) string {
-	if len(skipped) == 0 {
-		return ""
+// requestText is the request as the service ran it, under the call's own keys:
+// an open bound open, a padding of nothing 0, and page_from left out on a
+// continuation. With until open and after set, resolved_at is where the after
+// padding starts.
+func (s sample) requestText() string {
+	q := s.resp.Request
+	parts := []string{"since=" + boundText(q.Since), "until=" + boundText(q.Until)}
+	if q.Until == nil && q.After != (logs.Padding{}) {
+		parts = append(parts, "resolved_at="+logsinput.Stamp(s.resp.ResolvedAt))
 	}
-	var b strings.Builder
-	b.WriteString(" Could not read ")
-	for i, line := range skipped {
-		if i > 0 && b.Len()+len(line)+2 > skippedBudget {
-			fmt.Fprintf(&b, ", and %d more streams", len(skipped)-i)
-			break
-		}
-		if i > 0 {
-			b.WriteString("; ")
-		}
-		b.WriteString(line)
+	parts = append(parts, "before="+paddingText(q.Before), "after="+paddingText(q.After))
+	if q.PageFrom != "" {
+		parts = append(parts, "page_from="+string(q.PageFrom))
 	}
-	b.WriteString(".")
-	return b.String()
+	parts = append(parts, "page_size="+strconv.Itoa(q.PageSize), "max_message_bytes="+strconv.Itoa(q.MaxMessageBytes),
+		"max_page_bytes="+strconv.Itoa(q.MaxPageBytes))
+	return "request: " + strings.Join(parts, " ")
 }
 
-// action is the sample as the row keeps it: the view read, the range's ends as
-// moments, and the lines the model read, with the view View around this opens at
-// the first of them.
-func (s sample) action(in input, view tools.LogsViewAction) tools.LogsReadAction {
+func boundText(at *time.Time) string {
+	if at == nil {
+		return "open"
+	}
+	return logsinput.Stamp(*at)
+}
+
+func paddingText(p logs.Padding) string {
+	if p.Span > 0 {
+		return iso8601.Format(p.Span)
+	}
+	return strconv.Itoa(p.Lines)
+}
+
+// pageText is the page's three tokens, none for each the page has not.
+func (s sample) pageText() string {
+	token := func(c *string) string {
+		if c == nil {
+			return "none"
+		}
+		return *c
+	}
+	p := s.resp.Page
+	return "page: prev=" + token(p.Prev) + " next=" + token(p.Next) + " follow=" + token(p.Follow)
+}
+
+// action is the sample as the row keeps it: the window the service ran, the lines
+// the model read, whether the page had more either way, its notices, and the view
+// View around this opens at the first line's moment.
+func (s sample) action() tools.LogsReadAction {
+	q := s.resp.Request
 	read := tools.LogsReadAction{
-		LogsViewInput: view.LogsViewInput, Mode: in.mode, ResolvedAt: view.ResolvedAt,
-		Lines: []tools.LogsReadLine{}, Dropped: s.dropped, Before: s.before, After: s.after, Skipped: s.skipped,
+		LogsScopeInput: q.Scope, Since: q.Since, Until: q.Until, Before: tools.LogsPaddingOf(q.Before), After: tools.LogsPaddingOf(q.After),
+		ResolvedAt: s.resp.ResolvedAt, Lines: []tools.LogsReadLine{}, OlderMore: s.resp.Page.Prev != nil,
+		NewerMore: s.resp.Page.Next != nil, Notices: []tools.LogsNotice{},
 	}
-	if in.since != nil {
-		read.Since = &in.since.at
-	}
-	if in.until != nil {
-		read.Until = &in.until.at
+	if q.PageFrom != "" {
+		read.PageFrom = &q.PageFrom
 	}
 	for _, rec := range s.records {
 		read.Lines = append(read.Lines, logsinput.ReadLine(rec))
 	}
+	for _, n := range s.resp.Notices {
+		read.Notices = append(read.Notices, tools.LogsNotice{Code: string(n.Code), Message: logline.ForModel(n.Message)})
+	}
 	if len(s.records) > 0 {
-		read.ViewAround = logsinput.ViewAround(view.LogsViewInput, s.records[0].Timestamp, view.ResolvedAt)
+		read.ViewAround = logsinput.ViewAround(q.Scope, s.records[0].Timestamp, s.resp.ResolvedAt)
 	}
 	return read
 }

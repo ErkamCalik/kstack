@@ -47,14 +47,14 @@ type Resolver struct {
 	// Executables probes the executables sandboxed commands run: the Bash tool, nil where
 	// there is no shell.
 	Executables ExecutableProber
-	// Logs serves a view's lines: a page around a cursor, and a follow.
+	// Logs pages and follows a scope's lines.
 	Logs LogsService
 }
 
-// LogsService reads a view's lines: *logs.Service, or a test's fake.
+// LogsService pages and follows a scope's lines: *logs.Service, or a test's fake.
 type LogsService interface {
-	Fetch(ctx context.Context, id cluster.ClusterID, view logs.View, q logs.FetchQuery) (logs.Page, error)
-	Follow(ctx context.Context, id cluster.ClusterID, view logs.View, after *string) (*cluster.Stream[logs.FollowFrame], error)
+	Fetch(ctx context.Context, id cluster.ClusterID, q logs.FetchRequest) (logs.FetchResponse, error)
+	Follow(ctx context.Context, id cluster.ClusterID, q logs.FollowRequest) (logs.FollowResponse, error)
 }
 
 // ExecutableProber is the executable probe: *bash.Tool, or a test's fake. StartProbe

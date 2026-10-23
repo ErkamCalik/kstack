@@ -9,7 +9,6 @@ import (
 
 	"errors"
 	"fmt"
-	"github.com/amorey/gochan/watch"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/amorey/gochan/watch"
 
 	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
@@ -35,7 +36,9 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/run/sandbox"
 	"github.com/kstackhq/kstack/sidecar/internal/services/cluster/clustercard"
 	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/logline"
 	"github.com/kstackhq/kstack/sidecar/internal/services/logs/logstore"
+	logsrefusal "github.com/kstackhq/kstack/sidecar/internal/services/logs/refusal"
 	"github.com/kstackhq/kstack/sidecar/internal/services/memory"
 	"github.com/kstackhq/kstack/sidecar/internal/services/settings"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
@@ -1634,7 +1637,7 @@ func newChatServerOn(t *testing.T, status sandbox.Status, svc *settings.Service)
 	// The search is offered, since a test stages a turn that searched, and LogsView
 	// answering one fixed view; the rest is read alone, so no call runs while stored
 	// calls still show.
-	box := tools.NewBox([]tools.Tool{agent.New(), anthropicwebsearch.New(time.Now), openedView{logsview.New(nil, time.Now)}}, bash.Reader{}, &read.Tool{}, &write.Tool{}, &edit.Tool{}, &webfetch.Tool{}, taskstop.New(), memorytool.New(nil), kubequery.New(nil), logsread.New(nil, nil, time.Now), logswatch.New(nil, nil, time.Now))
+	box := tools.NewBox([]tools.Tool{agent.New(), anthropicwebsearch.New(time.Now), openedView{logsview.New(nil)}}, bash.Reader{}, &read.Tool{}, &write.Tool{}, &edit.Tool{}, &webfetch.Tool{}, taskstop.New(), memorytool.New(nil), kubequery.New(nil), logsread.New(nil, nil), logswatch.New(nil, nil))
 	chatSvc, err := chat.New(db, filepath.Join(t.TempDir(), "chats"), filepath.Join(t.TempDir(), "monitor"), llmSvc, clustercard.New(newFakeClusterService(nil)), nil, box, cat, status, svc)
 	require.NoError(t, err)
 	stop, err := chatSvc.Start(t.Context())
@@ -1656,7 +1659,7 @@ func newChatServerOn(t *testing.T, status sandbox.Status, svc *settings.Service)
 type openedView struct{ *logsview.Tool }
 
 var viewOpened = tools.LogsViewAction{
-	LogsViewInput: tools.LogsViewInput{
+	LogsScopeInput: tools.LogsScopeInput{
 		Sources: []tools.LogsViewSource{{Namespace: "prod", Kind: tools.LogsSourceDeployment, Name: "webapp", Containers: []string{}}},
 		Filters: []tools.LogsViewFilter{},
 	},
@@ -3311,121 +3314,162 @@ func TestSandboxExecutableRemoveWorksWithNoSandbox(t *testing.T) {
 
 // --- Logs ---
 
-// fakeLogs is the log service answering page and stream, and keeping what it was
-// asked.
+// fakeLogs is the log service answering a page or a stream, and keeping what it
+// was asked.
 type fakeLogs struct {
-	page   logs.Page
-	stream *cluster.Stream[logs.FollowFrame]
-	view   logs.View
-	query  logs.FetchQuery
-	after  *string
+	page    logs.FetchResponse
+	refused error
+	stream  *cluster.Stream[logs.FollowFrame]
+	fetched logs.FetchRequest
+	follow  logs.FollowRequest
 }
 
-func (f *fakeLogs) Fetch(_ context.Context, _ cluster.ClusterID, view logs.View, q logs.FetchQuery) (logs.Page, error) {
-	f.view, f.query = view, q
-	return f.page, nil
+func (f *fakeLogs) Fetch(_ context.Context, _ cluster.ClusterID, q logs.FetchRequest) (logs.FetchResponse, error) {
+	f.fetched = q
+	return f.page, f.refused
 }
 
-func (f *fakeLogs) Follow(_ context.Context, _ cluster.ClusterID, view logs.View, after *string) (*cluster.Stream[logs.FollowFrame], error) {
-	f.view, f.after = view, after
-	return f.stream, nil
+func (f *fakeLogs) Follow(_ context.Context, _ cluster.ClusterID, q logs.FollowRequest) (logs.FollowResponse, error) {
+	f.follow = q
+	return logs.FollowResponse{Request: q, Frames: f.stream}, nil
 }
 
-// logsView is a view's input as the client sends it.
-const logsView = `{sources: [{namespace: "prod", kind: Deployment, name: "web", containers: ["app"], allContainers: false, previous: false}],
+// logsScope is a scope's input as the client sends it.
+const logsScope = `{sources: [{namespace: "prod", kind: Deployment, name: "web", containers: ["app"], allContainers: false, previous: false}],
 filters: [{field: Zone, values: ["eu-1a"]}], grep: "error"}`
 
-// logsFetch serves a page, its edges, its anchor, its skipped streams and each
-// record's hole included, from the view, mode, cursor, moment and limit asked.
-func TestLogsFetchServesAPage(t *testing.T) {
+// logsLine is a line of prod/web-1/app saying hello.
+func logsLine(stamp time.Time) *logline.Record {
+	return &logline.Record{Timestamp: stamp, Message: "hello", Stream: logline.StreamKey{Namespace: "prod", Pod: "web-1", Container: "app"}, TruncatedBytes: 3}
+}
+
+// A first page with context reaches the service as asked, and its answer comes
+// back whole: the request as it ran, its place, its lines and its notices.
+func TestLogsFetchAnswersAFirstPage(t *testing.T) {
 	stamp := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
-	before, after := "2026-10-08T09:00:00Z", "2026-10-08T10:00:00Z"
-	anchor := 1
-	web1 := logs.StreamKey{Namespace: "prod", Pod: "web-1", Container: "app"}
-	fake := &fakeLogs{page: logs.Page{
-		Records: []logs.Record{
-			{Timestamp: stamp, Message: "error: disk", Stream: web1, Place: logs.Place{Zone: "eu-1a"}, ContainerID: "containerd://web-1-app"},
-			{Timestamp: stamp.Add(time.Minute), Message: "error: net", Stream: web1, ContainerID: "containerd://web-1-app",
-				Gap: &logs.Gap{After: stamp, Before: stamp.Add(time.Minute)}},
+	next := "next-cursor"
+	scope := logs.Scope{
+		Sources: []logs.ScopeSource{{Namespace: "prod", Kind: logs.SourceDeployment, Name: "web", Containers: []string{"app"}}},
+		Filters: []logs.ScopeFilter{{Field: logs.FilterZone, Values: []string{"eu-1a"}}},
+		Grep:    "error",
+	}
+	fake := &fakeLogs{page: logs.FetchResponse{
+		Request: logs.FetchRequest{
+			Scope: scope, Window: logs.Window{Since: &stamp, Before: logs.Padding{Lines: 10}, After: logs.Padding{Span: 5 * time.Minute}},
+			PageFrom: logs.PageFromFirst, PageSize: 100, MaxMessageBytes: 16387, MaxPageBytes: 1 << 20,
 		},
-		Before:  logs.PageEdge{Cursor: &before, More: true},
-		After:   logs.PageEdge{Cursor: &after},
-		Anchor:  &anchor,
-		Skipped: []string{"web-2/app: container is waiting to start"},
+		ResolvedAt: stamp.Add(time.Hour),
+		Page:       logs.Page{Next: &next},
+		Records:    []logline.Record{*logsLine(stamp)},
+		Notices:    []logs.Notice{{Code: logsrefusal.CodePaddingShort, Message: "fewer lines before"}},
 	}}
 	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Logs: fake}))
 	defer srv.Close()
 
-	raw := postGQL(t, srv.URL, fmt.Sprintf(`{"query":%q}`, `{ logsFetch(id: "7", view: `+logsView+`, mode: Around, at: "2026-10-08T10:00:00Z", limit: 20) {
-		records { timestamp message stream { pod container previous } place { node zone } cursor gap { after before } }
-		before { cursor more } after { cursor more } anchor skipped } }`))
+	data, errs := mutation(t, srv.URL, `{ logsFetch(id: "7", request: {scope: `+logsScope+`, since: "2026-10-08T10:00:00Z",
+		before: {lines: 10}, after: {span: "PT300S"}, pageFrom: First}) {
+		request { sources { name } grep since until before { lines span } after { lines span } pageFrom pageSize maxMessageBytes maxPageBytes }
+		resolvedAt page { prev next follow } records { message truncatedBytes cursor } notices { code message } } }`)
 
-	assert.JSONEq(t, `{"data":{"logsFetch":{
-		"records":[{"timestamp":"2026-10-08T10:00:00Z","message":"error: disk","stream":{"pod":"web-1","container":"app","previous":false},"place":{"node":"","zone":"eu-1a"},
-			"cursor":"2026-10-08T10:00:00Z\tprod\tweb-1\tapp\tcontainerd://web-1-app\t0","gap":null},
-			{"timestamp":"2026-10-08T10:01:00Z","message":"error: net","stream":{"pod":"web-1","container":"app","previous":false},"place":{"node":"","zone":""},
-			"cursor":"2026-10-08T10:01:00Z\tprod\tweb-1\tapp\tcontainerd://web-1-app\t0","gap":{"after":"2026-10-08T10:00:00Z","before":"2026-10-08T10:01:00Z"}}],
-		"before":{"cursor":"2026-10-08T09:00:00Z","more":true},"after":{"cursor":"2026-10-08T10:00:00Z","more":false},
-		"anchor":1,"skipped":["web-2/app: container is waiting to start"]}}}`, string(raw))
-	assert.Equal(t, logs.View{
-		Sources: []logs.ViewSource{{Namespace: "prod", Kind: logs.SourceDeployment, Name: "web", Containers: []string{"app"}}},
-		Filters: []logs.ViewFilter{{Field: logs.FilterZone, Values: []string{"eu-1a"}}},
-		Grep:    "error",
-	}, fake.view)
-	assert.Equal(t, logs.FetchQuery{Mode: logs.FetchAround, At: &stamp, Limit: 20}, fake.query)
-
-	postGQL(t, srv.URL, fmt.Sprintf(`{"query":%q}`, `{ logsFetch(id: "7", view: `+logsView+`, mode: Tail, cursor: "x", limit: 5) { skipped } }`))
-	cursor := "x"
-	assert.Equal(t, logs.FetchQuery{Mode: logs.FetchTail, Cursor: &cursor, Limit: 5}, fake.query)
+	require.Empty(t, errs)
+	assert.Equal(t, logs.FetchRequest{
+		Scope: scope, Window: logs.Window{Since: &stamp, Before: logs.Padding{Lines: 10}, After: logs.Padding{Span: 5 * time.Minute}},
+		PageFrom: logs.PageFromFirst,
+	}, fake.fetched)
+	page := data["logsFetch"].(map[string]any)
+	assert.Equal(t, map[string]any{
+		"sources": []any{map[string]any{"name": "web"}}, "grep": "error", "since": "2026-10-08T10:00:00Z", "until": nil,
+		"before": map[string]any{"lines": float64(10), "span": ""}, "after": map[string]any{"lines": float64(0), "span": "PT5M"},
+		"pageFrom": "First", "pageSize": float64(100), "maxMessageBytes": float64(16387), "maxPageBytes": float64(1 << 20),
+	}, page["request"])
+	assert.Equal(t, "2026-10-08T11:00:00Z", page["resolvedAt"])
+	assert.Equal(t, map[string]any{"prev": nil, "next": "next-cursor", "follow": nil}, page["page"])
+	assert.Equal(t, []any{map[string]any{"message": "hello", "truncatedBytes": float64(3), "cursor": logsLine(stamp).Cursor()}}, page["records"])
+	assert.Equal(t, []any{map[string]any{"code": "padding-short", "message": "fewer lines before"}}, page["notices"])
 }
 
-// logsFetch refuses a limit past 500, and a query its mode does not take, as a
-// validation error, saying so.
-func TestLogsFetchRefusesABadQuery(t *testing.T) {
-	logsSvc := logs.New(nil, t.TempDir(), logstore.DefaultRetention)
-	t.Cleanup(func() { assert.NoError(t, logsSvc.Close()) })
-	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Logs: logsSvc}))
+// A continuation's cursor reaches the service as it came, with seen beside it,
+// and its echoed request comes back with no pageFrom.
+func TestLogsFetchPassesAContinuationThrough(t *testing.T) {
+	fake := &fakeLogs{page: logs.FetchResponse{Request: logs.FetchRequest{PageSize: 100}, Notices: []logs.Notice{}}}
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Logs: fake}))
 	defer srv.Close()
 
-	for query, reason := range map[string]string{
-		`mode: Head, limit: 501`:                                          "a limit must be between 1 and 500",
-		`mode: Head, at: "2026-10-08T10:00:00Z", limit: 5`:                "a Head page takes no at",
-		`mode: Around, cursor: "x", at: "2026-10-08T10:00:00Z", limit: 5`: "an Around page takes no cursor",
-	} {
-		raw := postGQL(t, srv.URL, fmt.Sprintf(`{"query":%q}`, `{ logsFetch(id: "7", view: `+logsView+`, `+query+`) { skipped } }`))
+	data, errs := mutation(t, srv.URL, `{ logsFetch(id: "7", request: {cursor: "opaque", seen: ["line-a"]}) { request { pageFrom } records { message } notices { code } } }`)
 
-		assert.Contains(t, string(raw), `"code":"KSTACK_VALIDATION_ERROR"`, query)
-		assert.Contains(t, string(raw), reason, query)
+	require.Empty(t, errs)
+	cursor := "opaque"
+	assert.Equal(t, logs.FetchRequest{Cursor: &cursor, Seen: []string{"line-a"}}, fake.fetched)
+	page := data["logsFetch"].(map[string]any)
+	assert.Equal(t, map[string]any{"pageFrom": nil}, page["request"])
+	assert.Equal(t, []any{}, page["records"])
+	assert.Equal(t, []any{}, page["notices"])
+}
+
+// A refusal arrives as a validation error whose rule is its code, and a span the
+// wire cannot read is refused before the service is asked.
+func TestLogsFetchRefusesWithTheCode(t *testing.T) {
+	fake := &fakeLogs{refused: logsrefusal.New(logsrefusal.CodeCursorInvalid, "read again without the cursor")}
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Logs: fake}))
+	defer srv.Close()
+
+	_, errs := mutation(t, srv.URL, `{ logsFetch(id: "7", request: {cursor: "stale"}) { resolvedAt } }`)
+	require.Len(t, errs, 1)
+	assert.Equal(t, "KSTACK_VALIDATION_ERROR", errs[0].Extensions["code"])
+	assert.Equal(t, "cursor-invalid", errs[0].Extensions["rule"])
+	assert.Equal(t, "read again without the cursor", errs[0].Message)
+
+	fake.fetched = logs.FetchRequest{PageSize: -1}
+	_, errs = mutation(t, srv.URL, `{ logsFetch(id: "7", request: {scope: `+logsScope+`, pageFrom: Last, before: {span: "P1M"}}) { resolvedAt } }`)
+	require.Len(t, errs, 1)
+	assert.Equal(t, "bad-padding", errs[0].Extensions["rule"])
+	assert.Equal(t, -1, fake.fetched.PageSize, "the service was not asked")
+}
+
+// Null and zero are one thing on the wire, as they are to the service: an empty
+// scope beside a cursor is a continuation, which the service reads as far as the
+// cursor; one naming a grep is refused beside it.
+func TestLogsFetchReadsAnEmptyScopeAsNone(t *testing.T) {
+	svc := logs.New(nil, t.TempDir(), logstore.Retention{})
+	t.Cleanup(func() { _ = svc.Close() })
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Logs: svc}))
+	defer srv.Close()
+
+	for grep, rule := range map[string]string{"": "cursor-invalid", "error": "conflicting-parameters"} {
+		_, errs := mutation(t, srv.URL, `{ logsFetch(id: "7", request: {scope: {sources: [], filters: [], grep: "`+grep+`"}, cursor: "opaque"}) { resolvedAt } }`)
+		require.Len(t, errs, 1, grep)
+		assert.Equal(t, rule, errs[0].Extensions["rule"], grep)
 	}
 }
 
-// logsFollow streams each line and checkpoint, each bound by its type, then the frame
-// that ends it with its reason.
+// logsFollow passes its request through, then streams a line, a notice and the
+// frame that ends it with its code, each bound by its type.
 func TestLogsFollowStreamsUntilItEnds(t *testing.T) {
 	stamp := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
-	checkpoint := "2026-10-08T10:00:00Z"
 	release := make(chan struct{})
 	fake := &fakeLogs{stream: cluster.NewStream(t.Context(), func(ctx context.Context, out chan<- logs.FollowFrame) error {
-		out <- logs.FollowFrame{Type: logs.FollowLine, Record: &logs.Record{Timestamp: stamp, Message: "hello", Stream: logs.StreamKey{Pod: "web-1", Container: "app"}}}
-		out <- logs.FollowFrame{Type: logs.FollowCheckpoint, Cursor: &checkpoint}
+		out <- logs.FollowFrame{Record: logsLine(stamp)}
+		out <- logs.FollowFrame{Notice: &logs.Notice{Code: logsrefusal.CodeStreamSkipped, Message: "prod/web-2/app: forbidden"}}
 		<-release
-		out <- logs.FollowFrame{Type: logs.FollowEnded, Reason: "every container of this view has stopped"}
+		ended := logsrefusal.New(logsrefusal.CodeFinished, "every container of this view has stopped")
+		out <- logs.FollowFrame{Ended: &ended}
 		return nil
 	})}
 	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Logs: fake}))
 	defer srv.Close()
 
-	resp, events := chatFrames(t, srv, `subscription { logsFollow(id: "7", view: `+logsView+`, after: "c") { type record { message stream { pod } } cursor reason } }`)
+	resp, events := chatFrames(t, srv, `subscription { logsFollow(id: "7", request: {cursor: "c", seen: ["line-a"], maxMessageBytes: 100}) {
+		type record { message truncatedBytes stream { pod } } notice { code message } ended { code message } } }`)
 	defer resp.Body.Close()
 
 	line := testutil.Recv(t, events, "the line").data
-	assert.Contains(t, line, `"type":"Line","record":{"message":"hello"`)
-	assert.Contains(t, line, `"cursor":null`)
-	assert.Equal(t, "c", *fake.after)
-	assert.Contains(t, testutil.Recv(t, events, "the checkpoint").data, `"type":"Checkpoint","record":null,"cursor":"2026-10-08T10:00:00Z","reason":""`)
+	assert.Contains(t, line, `"type":"Line","record":{"message":"hello","truncatedBytes":3,"stream":{"pod":"web-1"}},"notice":null,"ended":null`)
+	cursor := "c"
+	assert.Equal(t, logs.FollowRequest{Cursor: &cursor, Seen: []string{"line-a"}, MaxMessageBytes: 100}, fake.follow)
+	assert.Contains(t, testutil.Recv(t, events, "the notice").data, `"type":"Notice","record":null,"notice":{"code":"stream-skipped","message":"prod/web-2/app: forbidden"},"ended":null`)
 	close(release)
 	ev := testutil.Recv(t, events, "the end")
-	assert.Contains(t, ev.data, `"type":"Ended","record":null,"cursor":null,"reason":"every container of this view has stopped"`)
+	assert.Contains(t, ev.data, `"type":"Ended","record":null,"notice":null,"ended":{"code":"finished","message":"every container of this view has stopped"}`)
 	assert.NotContains(t, ev.data, `"watchFailed"`)
 }
 
@@ -3437,7 +3481,7 @@ func TestLogsFollowReportsItsFailure(t *testing.T) {
 	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Logs: fake}))
 	defer srv.Close()
 
-	resp, events := chatFrames(t, srv, `subscription { logsFollow(id: "7", view: `+logsView+`) { type } }`)
+	resp, events := chatFrames(t, srv, `subscription { logsFollow(id: "7", request: {scope: `+logsScope+`}) { type } }`)
 	defer resp.Body.Close()
 
 	assert.Contains(t, testutil.Recv(t, events, "the failure frame").data, `"watchFailed":true`)

@@ -31,98 +31,100 @@ const (
 	maxWatch     = 24 * time.Hour
 )
 
-// input is one call's arguments: the view's, the window and the limits. since is
-// where the window starts, now for none; after is the cursor the follow reads
-// past; until is when the watch ends on time alone, and capped whether that was
-// cut to maxWatch.
+// The forms since and until take, which a refusal names with the clock.
+const (
+	sinceForms = "an RFC 3339 time or an ISO 8601 duration back from now such as PT10M, not after now"
+	untilForms = "an RFC 3339 time or an ISO 8601 duration ahead of now such as PT2H, after now"
+)
+
+// input is one call's arguments: the scope's, and where the watch starts, since,
+// now for none, or the cursor a read printed, nil for none; until is when the
+// watch ends on time alone, and capped whether that was cut to maxWatch; then the
+// limits.
 type input struct {
 	logsinput.Input
-	since           time.Time
-	after           string
-	until           time.Time
-	capped          bool
-	limit, maxBytes int
+	since  time.Time
+	cursor *string
+	until  time.Time
+	capped bool
+
+	limit, maxBytes, maxMessageBytes int
 }
 
-// sinceMessage and untilMessage are the refusals of an end the tool cannot read on
-// the clock now, which they name so the retry can be exact.
-func sinceMessage(now time.Time) string {
-	return "an RFC 3339 time or an ISO 8601 duration back from now such as PT10M, not after now, or a cursor a read printed; now is " + now.UTC().Format(time.RFC3339)
-}
-
-func untilMessage(now time.Time) string {
-	return "an RFC 3339 time or an ISO 8601 duration ahead of now such as PT2H, after now; now is " + now.UTC().Format(time.RFC3339)
-}
-
-// parse reads the call's arguments, the shared ones through logsinput, and resolves
+// parse reads the call's arguments, the shared ones through logsinput, and reads
 // the window on the clock now.
 func parse(raw json.RawMessage, now time.Time) (input, error) {
-	in := input{limit: defaultLimit, maxBytes: logsinput.SampleBudget}
-	var since, until string
+	in := input{limit: defaultLimit, maxBytes: logsinput.SampleBudget, maxMessageBytes: logsinput.DefaultMessageBytes}
+	var since, until, cursor string
 	shared, err := logsinput.Parse(raw, logsinput.Fields{
-		"since": &since, "until": &until, "limit": &in.limit, "max_bytes": &in.maxBytes,
-		"anchor":     logsinput.BadInput("anchor", "a watch takes since and until"),
-		"pin_to_end": logsinput.BadInput("pin_to_end", "a watch opens no viewer"),
-		"mode":       logsinput.BadInput("mode", "a watch reads its lines in order"),
+		"since": &since, "until": &until, "cursor": &cursor, "limit": &in.limit, "max_bytes": &in.maxBytes,
+		"max_message_bytes": &in.maxMessageBytes,
+		"anchor":            logsinput.BadInput("anchor", "a watch takes since and until"),
+		"pin_to_end":        logsinput.BadInput("pin_to_end", "a watch opens no viewer"),
+		"page_from":         logsinput.BadInput("page_from", "a watch reads its lines in order"),
 	})
 	if err != nil {
 		return input{}, err
 	}
 	in.Input = shared
-	if in.limit < 1 || in.limit > maxLimit {
+	switch {
+	case in.limit < 1 || in.limit > maxLimit:
 		return input{}, logsinput.BadInput("limit", fmt.Sprintf("1 to %d", maxLimit))
-	}
-	if in.maxBytes < 1 || in.maxBytes > logsinput.SampleBudget {
+	case in.maxBytes < 1 || in.maxBytes > logsinput.SampleBudget:
 		return input{}, logsinput.BadInput("max_bytes", fmt.Sprintf("1 to %d", logsinput.SampleBudget))
-	}
-	if in.since, in.after, err = startOf(since, now); err != nil {
-		return input{}, err
 	}
 	if in.until, in.capped, err = untilOf(until, now); err != nil {
 		return input{}, err
 	}
-	return in, nil
+	if err := logsinput.CheckMessageBytes(in.maxMessageBytes); err != nil {
+		return input{}, err
+	}
+	if cursor != "" {
+		if in.NamesScope() || since != "" {
+			return input{}, logsinput.BadInput("cursor", "a token already names the sources, filters, grep and where the watch starts: send it without them")
+		}
+		in.cursor = &cursor
+		return in, nil
+	}
+	if len(in.Sources) == 0 {
+		return input{}, logsinput.BadInput("sources", "name sources, or a next or follow token a read printed")
+	}
+	in.since, err = sinceOf(since, now)
+	return in, err
 }
 
-// startOf is where the window s names starts, on the clock now, and the cursor
-// the follow reads past: for none, a moment, or a duration back from now, the
-// moment and a nanosecond before it, which is how the service spells a moment
-// whose lines it keeps; for a cursor a read printed, its line's moment and the
-// service's own cursor. The follow is always told its start: the one it would
-// pick itself comes after its setup, and the window says now. A cursor is
-// base64url JSON, starting eyJ, so it never reads as a duration.
-func startOf(s string, now time.Time) (time.Time, string, error) {
+// sinceOf is where the window s names starts on the clock now: now for none, else
+// a moment not after now.
+func sinceOf(s string, now time.Time) (time.Time, error) {
 	if s == "" {
-		return now, before(now), nil
+		return now, nil
 	}
-	if at, ok := logsinput.MomentOf(s, now, logsinput.Behind); ok && !at.After(now) {
-		return at, before(at), nil
-	}
-	after, at, err := logsinput.DecodeCursor(s)
-	if errors.Is(err, logsinput.ErrOldCursor) {
-		return time.Time{}, "", logsinput.BadInput("since", logsinput.OldCursorMessage)
+	at, err := logsinput.MomentOf(s, now, logsinput.Since, logsinput.Behind)
+	if err == nil && at.After(now) {
+		err = errAfterNow
 	}
 	if err != nil {
-		return time.Time{}, "", logsinput.BadInput("since", sinceMessage(now))
+		return time.Time{}, logsinput.BadInput("since", logsinput.MomentMessage(err, sinceForms, now))
 	}
-	return at, after, nil
+	return at, nil
 }
 
-// before is the cursor a nanosecond ahead of the moment t, which a follow from it
-// reads past.
-func before(t time.Time) string { return t.Add(-time.Nanosecond).Format(time.RFC3339Nano) }
+// errAfterNow is a since past now or an until not after it.
+var errAfterNow = errors.New("on the wrong side of now")
 
-// untilOf is when the watch ends on time alone: the moment s names ahead of now, or
-// a duration from now, cut to maxWatch from now with capped set; maxWatch from now
-// for none.
+// untilOf is when the watch ends on time alone: the moment s names after now, cut
+// to maxWatch from now with capped set; maxWatch from now for none.
 func untilOf(s string, now time.Time) (time.Time, bool, error) {
 	limit := now.Add(maxWatch)
 	if s == "" {
 		return limit, false, nil
 	}
-	at, ok := logsinput.MomentOf(s, now, logsinput.Ahead)
-	if !ok || !at.After(now) {
-		return time.Time{}, false, logsinput.BadInput("until", untilMessage(now))
+	at, err := logsinput.MomentOf(s, now, logsinput.Until, logsinput.Ahead)
+	if err == nil && !at.After(now) {
+		err = errAfterNow
+	}
+	if err != nil {
+		return time.Time{}, false, logsinput.BadInput("until", logsinput.MomentMessage(err, untilForms, now))
 	}
 	if at.After(limit) {
 		return limit, true, nil
