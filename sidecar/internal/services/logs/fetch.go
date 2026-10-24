@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -93,11 +94,12 @@ type Notice struct {
 }
 
 // FetchRequest is one page. A first page sets Scope, what is read, Window, when, and
-// PageFrom; with PageFromFirst it may set Seen, the last line the caller has of each
-// stream, so that stream reads past its line and every other from the window's
-// start. A continuation sets Cursor, one of a page's Prev, Next or Follow as it
-// came: the cursor holds the scope and the window. Beside a Next or Follow it may
-// set Seen, merged into the cursor's entries, the newer line standing. PageSize is the
+// PageFrom; with no padding it may set Seen, a line the caller has of each stream,
+// so that stream reads from strictly past its line (PageFromFirst) or before it
+// (PageFromLast), and every other from the window's edge. A continuation sets
+// Cursor, one of a page's Prev, Next or Follow as it came: the cursor holds the
+// scope and the window. Beside a Next or Follow it may set Seen, merged into the
+// cursor's entries, the newer line standing. PageSize is the
 // lines a page holds, 1 to MaxPageSize, 0 for DefaultPageSize. MaxMessageBytes
 // cuts each message, 0 for the service's own cap. MaxPageBytes caps the sum of a
 // page's messages, 0 for MaxPageBytesCap. The three are read on every page.
@@ -164,7 +166,9 @@ type FetchResponse struct {
 //     Follow oldest first, never past the window's edge. Mixed requests are
 //     conflicting-parameters; a cursor the service did not write is cursor-invalid,
 //     and one whose scope is now refused keeps the scope's code. The scope is
-//     resolved again on every page.
+//     resolved again on every page. A workload's pods the mirror no longer holds
+//     are read from the file, found by the controller chain filed with their
+//     streams.
 //  7. Prev is set when a line is known older inside the window, Next when one is
 //     known newer. A window is live while its end is open, lies after now, or a
 //     counted After is short; its page with nothing newer sets Follow, never
@@ -236,8 +240,8 @@ func checkRequest(q FetchRequest) (FetchRequest, error) {
 		return q, refusal.New(refusal.CodeConflictingParameters, fmt.Sprintf("a first page comes from first or last, not %q", q.PageFrom))
 	case q.Cursor != nil && (!q.Scope.empty() || q.Window != (Window{})):
 		return q, refusal.New(refusal.CodeConflictingParameters, "a page cursor holds its scope and window, so a continuation sends neither")
-	case len(q.Seen) > 0 && (q.PageFrom == PageFromLast || q.Before != (Padding{}) || q.After != (Padding{})):
-		return q, refusal.New(refusal.CodeConflictingParameters, "seen goes with a first page from first, with no padding")
+	case len(q.Seen) > 0 && (q.Before != (Padding{}) || q.After != (Padding{})):
+		return q, refusal.New(refusal.CodeConflictingParameters, "seen goes with a first page with no padding")
 	case q.PageSize < 0 || q.PageSize > MaxPageSize:
 		return q, refusal.New(refusal.CodeBadPage, fmt.Sprintf("a page holds 1 to %d lines", MaxPageSize))
 	case err != nil:
@@ -453,7 +457,7 @@ func (s *Service) page(ctx context.Context, id cluster.ClusterID, qs ...pageQuer
 		return nil, err
 	}
 	defer file.Close()
-	streams, release, err := pageStreams(ctx, file, t, qs[0].scope)
+	streams, release, err := s.pageStreams(ctx, file, t, qs)
 	defer release()
 	if err != nil {
 		return nil, err
@@ -698,12 +702,13 @@ func (p *page) answer(ctx context.Context, q pageQuery, fills []streamFill) (mer
 // pages passed that way, one entry per stream, the stream read off the entry;
 // the same list a caller sends as a request's Seen. A stream with no entry goes
 // on from at, exclusive, a line or a moment; with at zero, from the window's
-// Start, since nothing of that stream has been shown. Only a newer cursor
-// carries entries, and only one going on from a page read the other way carries
-// both entries and at. before and after are distances, for a counted Padding:
-// the padding lines that lie between Since and this cursor's position, and
-// between it and Until; 0 for a position inside the range. A side whose edge is
-// not yet a position is paged by its count alone.
+// Start, since nothing of that stream has been shown. A newer cursor carries
+// entries, and so does an older one from a first page that sent Seen. Only a
+// newer one going on from a page read the other way carries both entries and at.
+// before and after are distances, for a counted Padding: the padding lines that
+// lie between Since and this cursor's position, and between it and Until; 0 for a
+// position inside the range. A side whose edge is not yet a position is paged by
+// its count alone.
 type pageCursor struct {
 	Scope
 	resolvedWindow
@@ -723,13 +728,14 @@ func firstPage(q FetchRequest, now time.Time) (pageCursor, error) {
 	if err := checkWindow(q.Window); err != nil {
 		return pageCursor{}, err
 	}
-	seen, err := seenOf(q.Seen)
+	newer := q.PageFrom == PageFromFirst
+	seen, err := seenOf(q.Seen, newer)
 	if err != nil {
 		return pageCursor{}, err
 	}
 	c := pageCursor{
 		Scope: q.Scope, resolvedWindow: resolvedWindow{Window: q.Window, ResolvedAt: now.UTC().Round(0)},
-		newer: q.PageFrom == PageFromFirst, seen: seen,
+		newer: newer, seen: seen,
 	}
 	if q.Since != nil && q.Before.Lines == 0 {
 		c.Start = logline.MomentAt(q.Since.Add(-q.Before.Span))
@@ -740,10 +746,11 @@ func firstPage(q FetchRequest, now time.Time) (pageCursor, error) {
 // errBadSeen refuses a Seen entry that does not name a line.
 var errBadSeen = refusal.New(refusal.CodeCursorInvalid, "a seen entry is a line cursor a record carried")
 
-// seenOf is a request's Seen as a cursor's entries: each the last line the caller
-// has of its stream, the newer of two for one stream standing, whatever their
-// order, so no stream reads lines again.
-func seenOf(seen []string) (map[logline.ContainerName]logline.RunPlace, error) {
+// seenOf is a request's Seen as a cursor's entries: each the line the caller has
+// of its stream nearest the read, whatever their order. Of two for one stream the
+// newer stands on a newer read and the older on an older one, so no stream reads
+// a line the caller holds again.
+func seenOf(seen []string, newer bool) (map[logline.ContainerName]logline.RunPlace, error) {
 	if len(seen) == 0 {
 		return nil, nil
 	}
@@ -756,23 +763,28 @@ func seenOf(seen []string) (map[logline.ContainerName]logline.RunPlace, error) {
 		if c.IsMoment() {
 			return nil, errBadSeen
 		}
-		keepNewer(out, c)
+		keepFarther(out, c, newer)
 	}
 	return out, nil
 }
 
-// keepNewer sets c's stream's entry in entries to c, unless the entry is newer.
-func keepNewer(entries map[logline.ContainerName]logline.RunPlace, c logline.Cursor) {
-	if e, ok := entries[c.ContainerName]; ok && logline.CompareCursors(c, logline.Cursor{ContainerName: c.ContainerName, RunPlace: e}) < 0 {
-		return
+// keepFarther sets c's stream's entry in entries to c, unless the entry lies
+// farther the way the read goes: newer on a newer read, older on an older one.
+func keepFarther(entries map[logline.ContainerName]logline.RunPlace, c logline.Cursor, newer bool) {
+	e, ok := entries[c.ContainerName]
+	if ok {
+		order := logline.CompareCursors(c, logline.Cursor{ContainerName: c.ContainerName, RunPlace: e})
+		if newer && order < 0 || !newer && order > 0 {
+			return
+		}
 	}
 	entries[c.ContainerName] = c.RunPlace
 }
 
 // mergeSeen is entries, which the caller owns, with a request's Seen merged in,
-// the newer line of a stream standing.
+// the newer line of a stream standing: Seen goes only beside a newer cursor.
 func mergeSeen(entries map[logline.ContainerName]logline.RunPlace, seen []string) (map[logline.ContainerName]logline.RunPlace, error) {
-	more, err := seenOf(seen)
+	more, err := seenOf(seen, true)
 	if err != nil {
 		return nil, err
 	}
@@ -780,7 +792,7 @@ func mergeSeen(entries map[logline.ContainerName]logline.RunPlace, seen []string
 		return more, nil
 	}
 	for name, place := range more {
-		keepNewer(entries, logline.Cursor{ContainerName: name, RunPlace: place})
+		keepFarther(entries, logline.Cursor{ContainerName: name, RunPlace: place}, true)
 	}
 	return entries, nil
 }
@@ -970,16 +982,17 @@ func (c pageCursor) live(now time.Time) bool {
 // Going newer, each stream goes on from its reach, the last line it passed, so a
 // stream whose clock runs behind loses no line; at goes on as it came. Going
 // older, history does not move, so one position is exact: the cut, else the
-// farthest line passed. Behind a newer page, the page's oldest line; behind an
-// older one, each stream's newest line on the page, and the farthest line passed
-// for a stream with none, so nothing the page showed is repeated.
+// farthest line passed. Entries move to each stream's reach either way, so a
+// stream whose clock runs behind never reads back from that position. Behind a
+// newer page, the page's oldest line; behind an older one, each stream's newest
+// line on the page, and the farthest line passed for a stream with none, so
+// nothing the page showed is repeated.
 func (c pageCursor) edges(m merge) (ahead pageCursor, behind *pageCursor) {
 	ahead = c
 	ahead.before, ahead.after = c.moved(m.records)
+	ahead.seen = c.reached(m)
 	var far logline.Cursor
-	if c.newer {
-		ahead.seen = c.reached(m)
-	} else {
+	if !c.newer {
 		far = farthest(logline.Older, m)
 		ahead.at = cmp.Or(m.cut, far, c.at)
 	}
@@ -1022,17 +1035,22 @@ func (c pageCursor) moved(recs []logline.Record) (before, after int) {
 func clamp(n, lines int) int { return max(0, min(n, lines)) }
 
 // reached is c's entries once m passed: each stream the page resolved at its
-// reach, the later of two runs of one name standing, and each other stream at its
-// incoming entry. An entry for a stream that left the scope is dropped.
+// reach the way c reads, the farther of two runs of one name standing, and each
+// other stream at its incoming entry. An entry for a stream that left the scope
+// is dropped. An older cursor has entries only from a first page's Seen.
 func (c pageCursor) reached(m merge) map[logline.ContainerName]logline.RunPlace {
+	if !c.newer && len(c.seen) == 0 {
+		return nil
+	}
 	out := map[logline.ContainerName]logline.RunPlace{}
 	passed := map[logline.ContainerName]logline.Cursor{}
+	dir := c.dir()
 	for _, r := range m.reaches {
 		name := r.run.ContainerName
 		if e, ok := c.seen[name]; ok {
 			out[name] = e
 		}
-		if p := r.passed(logline.Newer, m); !p.IsZero() && (passed[name].IsZero() || beyond(logline.Newer, p, passed[name])) {
+		if p := r.passed(dir, m); !p.IsZero() && (passed[name].IsZero() || beyond(dir, p, passed[name])) {
 			passed[name] = p
 		}
 	}
@@ -1303,14 +1321,12 @@ func fromOptionalJSON(j *logline.CursorJSON) (logline.Cursor, error) {
 	return j.Cursor()
 }
 
-// check refuses a decoded cursor no page writes: an older one with an entry, a
-// count outside 0 to its Lines, a Start before an open Since with no count, or a
-// window refused.
+// check refuses a decoded cursor no page writes: a count outside 0 to its Lines,
+// a Start before an open Since with no count, or a window refused.
 func (c pageCursor) check() error {
 	countOK := func(n int, p Padding) bool { return n >= 0 && n <= p.Lines }
 	switch {
 	case c.ResolvedAt.IsZero(),
-		!c.newer && len(c.seen) > 0,
 		!countOK(c.before, c.Window.Before), !countOK(c.after, c.Window.After),
 		c.Since == nil && c.Window.Before.Lines == 0 && !c.Start.IsZero(),
 		checkWindow(c.Window) != nil:
@@ -1461,8 +1477,8 @@ func (w resolvedWindow) afterIsEmpty(recs []logline.Record) bool {
 
 // ===== The streams a page reads =====
 
-// maxInstances is the most of a container's instances a page reads from the file
-// beside what the resolve hands out: a pod that crash-looped for days can hold
+// maxInstances is the most of one pod's container's instances a page reads from the
+// file beside what the resolve hands out: a pod that crash-looped for days can hold
 // hundreds, each a walk of its own.
 const maxInstances = 8
 
@@ -1493,7 +1509,7 @@ func (ps pageStream) run() logline.Cursor {
 // pageStreams files t's streams in file, each as its instance's row, and answers
 // them, then fileOnlyStreams. Every row is held from the moment its id is known
 // until release, which the caller owes even on an error.
-func pageStreams(ctx context.Context, file *logstore.Store, t target, scope Scope) (_ []pageStream, release func(), err error) {
+func (s *Service) pageStreams(ctx context.Context, file *logstore.Store, t target, reads []pageQuery) (_ []pageStream, release func(), err error) {
 	rows, err := fileStreams(ctx, file, t.streams)
 	if err != nil {
 		return nil, func() {}, err
@@ -1503,7 +1519,7 @@ func pageStreams(ctx context.Context, file *logstore.Store, t target, scope Scop
 	for i, st := range t.streams {
 		out[i] = pageStream{row: rows[i], st: &t.streams[i], key: st.key, place: st.place}
 	}
-	only, releaseOnly, err := fileOnlyStreams(ctx, file, t, scope)
+	only, releaseOnly, err := s.fileOnlyStreams(ctx, file, t, reads)
 	release = func() {
 		releaseRows()
 		releaseOnly()
@@ -1511,11 +1527,16 @@ func pageStreams(ctx context.Context, file *logstore.Store, t target, scope Scop
 	return append(out, only...), release, err
 }
 
-// fileOnlyStreams is each of scope's Pod sources' streams the file holds that the
-// resolve handed out for no source, each instance once across the scope. Every row
-// is held from the moment its id is known until release, which the caller owes
-// even on an error.
-func fileOnlyStreams(ctx context.Context, file *logstore.Store, t target, scope Scope) (_ []pageStream, release func(), err error) {
+// fileOnlyStreams is each stream the file holds that reads, one scope's reads over
+// one stream set, read beside the resolve's: a Pod source's instances the resolve
+// handed out for no source, and a workload's gone pods, found by the chains filed
+// with their streams, where a read reaches them. A pod is gone when the mirror no
+// longer holds it, and the mirror is asked: the resolve hands out no stream of a
+// live pod a previous view finds no previous instance of, and a workload's chain
+// still names a pod it orphaned. Each instance once across the scope. Every row is
+// held from the moment its id is known until release, which the caller owes even on
+// an error.
+func (s *Service) fileOnlyStreams(ctx context.Context, file *logstore.Store, t target, reads []pageQuery) (_ []pageStream, release func(), err error) {
 	var releases []func()
 	release = func() {
 		for _, r := range releases {
@@ -1523,36 +1544,133 @@ func fileOnlyStreams(ctx context.Context, file *logstore.Store, t target, scope 
 		}
 	}
 	seen := map[logline.Cursor]bool{}
+	resolvedPods := map[string]bool{}
 	for _, st := range t.streams {
 		seen[st.run()] = true
+		resolvedPods[st.gen.uid] = true
 	}
 	var out []pageStream
-	for _, src := range scope.Sources {
-		if src.Kind != SourcePod {
-			continue
-		}
-		held, err := file.PodStreams(ctx, src.Namespace, src.Name, t.pods[src.Namespace+"/"+src.Name])
-		if err != nil {
-			return nil, release, err
-		}
-		releases = append(releases, file.Hold(rowIDs(held)...))
-		key := src.Namespace + "/" + src.Name
-		_, live := t.pods[key]
-		pod := podNow{live: live, def: t.defaults[key], place: t.places[key]}
-		for _, row := range fileRows(held, src, scope.Filters, t.current, pod) {
-			current := t.current[containerKey(row.Namespace, row.Pod, row.Container)]
-			ps := pageStream{
-				row:   row,
-				key:   logline.StreamKey{Namespace: row.Namespace, Pod: row.Pod, Container: row.Container, Previous: row.ContainerID != current},
-				place: pod.placeOf(row),
-			}
+	add := func(src ScopeSource, rows []logstore.Stream) {
+		releases = append(releases, file.Hold(rowIDs(rows)...))
+		for _, row := range fileRows(t, rows, src, reads[0].scope.Filters) {
+			ps := fileStream(t, row)
 			if !seen[ps.run()] {
 				seen[ps.run()] = true
 				out = append(out, ps)
 			}
 		}
 	}
+	scope := reads[0].scope
+	var maybeGone []podRows
+	for i, src := range scope.Sources {
+		if src.Kind == SourcePod {
+			held, err := file.PodStreams(ctx, src.Namespace, src.Name, t.pods[src.Namespace+"/"+src.Name])
+			if err != nil {
+				return nil, release, err
+			}
+			add(src, held)
+			continue
+		}
+		if t.sourceUIDs[i] == "" {
+			continue
+		}
+		owned, err := file.OwnedStreams(ctx, t.sourceUIDs[i])
+		if err != nil {
+			return nil, release, err
+		}
+		// A pod the resolve handed out is in the mirror, so the mirror is asked about
+		// the rest alone, and about none on most pages.
+		var rows []logstore.Stream
+		for _, o := range owned {
+			if !resolvedPods[o.PodUID] && reaches(reads, fileStream(t, o.Stream), o.Oldest, o.Newest) {
+				rows = append(rows, o.Stream)
+			}
+		}
+		maybeGone = append(maybeGone, podRows{src, rows})
+	}
+	gone, err := s.gonePods(ctx, t.cacheID, maybeGone)
+	if err != nil {
+		return nil, release, err
+	}
+	for _, c := range maybeGone {
+		add(c.src, slices.DeleteFunc(c.rows, func(row logstore.Stream) bool { return !gone[row.PodUID] }))
+	}
 	return out, release, nil
+}
+
+// podRows is the file's rows a source would read were their pods gone.
+type podRows struct {
+	src  ScopeSource
+	rows []logstore.Stream
+}
+
+// gonePods is the UID of each pod of candidates the mirror behind cacheID no longer
+// holds. Unsure, podsGone answers none, and a live pod read as gone would serve a
+// current instance as previous, so none is the safe answer.
+func (s *Service) gonePods(ctx context.Context, cacheID cluster.ClusterCacheID, candidates []podRows) (map[string]bool, error) {
+	uids := map[string]bool{}
+	for _, c := range candidates {
+		for _, row := range c.rows {
+			uids[row.PodUID] = true
+		}
+	}
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	gone, err := s.podsGone(ctx, int64(cacheID), slices.Sorted(maps.Keys(uids)))
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, uid := range gone {
+		out[uid] = true
+	}
+	return out, nil
+}
+
+// reaches is whether ps, its lines running from oldest to newest, has a line one of
+// reads can deliver: at or past where ps's own read starts, since on a continuation
+// each stream goes on from its own entry and one with none from the window's edge,
+// and short of the read's far edge.
+func reaches(reads []pageQuery, ps pageStream, oldest, newest logstore.Pos) bool {
+	for _, q := range reads {
+		first, last := oldest, newest
+		if q.mode == logline.Older {
+			first, last = newest, oldest
+		}
+		far := q.far(ps)
+		if onward(q.mode, last, q.key(ps)) && (far == nil || onward(q.mode, *far, first)) {
+			return true
+		}
+	}
+	return false
+}
+
+// onward is whether a is at or past b, read mode.
+func onward(mode logline.Direction, a, b logstore.Pos) bool {
+	if mode == logline.Newer {
+		return a.Compare(b) >= 0
+	}
+	return a.Compare(b) <= 0
+}
+
+// podOf is what the mirror holds of row's pod: nothing once the pod is gone, though a
+// later pod of its name runs.
+func podOf(t target, row logstore.Stream) podNow {
+	key := row.Namespace + "/" + row.Pod
+	live := row.PodUID != "" && t.pods[key] == row.PodUID
+	return podNow{live: live, def: t.defaults[key], place: t.places[key]}
+}
+
+// fileStream is row as a page reads it from the file: previous unless it is its
+// container's current instance.
+func fileStream(t target, row logstore.Stream) pageStream {
+	current := t.current[containerKey(row.Namespace, row.Pod, row.Container)]
+	return pageStream{
+		row:   row,
+		key:   logline.StreamKey{Namespace: row.Namespace, Pod: row.Pod, Container: row.Container, Previous: row.ContainerID != current},
+		place: podOf(t, row).placeOf(row),
+	}
 }
 
 // rowIDs is the id of each of rows.
@@ -1564,10 +1682,10 @@ func rowIDs(rows []logstore.Stream) []int64 {
 	return ids
 }
 
-// fileStreams files streams in file, each as its instance's row, and answers the rows
-// with their ids, in order. A restart the mirror reported late may have filed the
-// next instance's lines under the one before, so the file's row of that one is
-// trimmed once its end is known.
+// fileStreams files streams in file, each as its instance's row with its pod's
+// controller chain, and answers the rows with their ids, in order. A restart the
+// mirror reported late may have filed the next instance's lines under the one before,
+// so the file's row of that one is trimmed once its end is known.
 func fileStreams(ctx context.Context, file *logstore.Store, streams []stream) ([]logstore.Stream, error) {
 	rows := make([]logstore.Stream, len(streams))
 	for i, st := range streams {
@@ -1576,7 +1694,7 @@ func fileStreams(ctx context.Context, file *logstore.Store, streams []stream) ([
 			Container: st.key.Container, Default: st.isDefault, ContainerID: st.gen.instance,
 			StartedAt: st.startedAt, FinishedAt: st.finishedAt,
 			Node: st.place.Node, Region: st.place.Region, Zone: st.place.Zone, OS: st.place.OS, Arch: st.place.Arch,
-			Labels: st.labels,
+			Labels: st.labels, Owners: st.owners,
 		}
 	}
 	ids, err := file.PutStreams(ctx, rows)
@@ -1630,25 +1748,24 @@ func (p podNow) isDefault(row logstore.Stream) bool {
 	return row.Default
 }
 
-// fileRows is the rows of held, a Pod source's streams in the file newest first per
+// fileRows is the rows of held, a pod's streams in the file newest first per
 // container, that src reads: the containers it names, every one, or the pod's
 // default, as the resolve names them; with Previous, not the pod's current instance;
-// in a place the filters keep; and each container's newest maxInstances.
-func fileRows(held []logstore.Stream, src ScopeSource, filters []ScopeFilter, current map[string]string, pod podNow) []logstore.Stream {
+// in a place the filters keep; and each container's newest maxInstances, per pod.
+func fileRows(t target, held []logstore.Stream, src ScopeSource, filters []ScopeFilter) []logstore.Stream {
 	var out []logstore.Stream
 	count := map[string]int{}
 	for _, row := range held {
+		pod, instances := podOf(t, row), row.PodUID+"/"+row.Container
 		switch {
 		case len(src.Containers) > 0 && !slices.Contains(src.Containers, row.Container),
 			len(src.Containers) == 0 && !src.AllContainers && !pod.isDefault(row),
-			src.Previous && row.ContainerID == current[containerKey(row.Namespace, row.Pod, row.Container)],
-			!keptByFilters(pod.placeOf(row), filters):
+			src.Previous && row.ContainerID == t.current[containerKey(row.Namespace, row.Pod, row.Container)],
+			!keptByFilters(pod.placeOf(row), filters),
+			count[instances] == maxInstances:
 			continue
 		}
-		if count[row.Container] == maxInstances {
-			continue
-		}
-		count[row.Container]++
+		count[instances]++
 		out = append(out, row)
 	}
 	return out
