@@ -15,9 +15,9 @@
 
 // The log viewer: the library's core behind a view's props. It builds the view's client
 // once per mount (the caller keys it on the call's id, so a new call is a fresh landing
-// and a re-render of the same call moves nothing), lands at `openAt`, starts pinned as
-// `pinToEnd` says, draws each line as a row, and writes what is on screen and what is
-// selected into `viewport` for whoever pulls it.
+// and a re-render of the same call moves nothing) and again for each grep the toolbar
+// submits, lands at `openAt`, starts pinned as `pinToEnd` says, draws each line as a row,
+// and writes what is on screen and what is selected into `viewport` for whoever pulls it.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useClient } from 'urql';
 
@@ -59,6 +59,8 @@ export type LogViewerProps = {
   /** Whether it starts pinned to the end. */
   pinToEnd: boolean;
   viewport: LogViewportHandle;
+  /** Called with each grep the toolbar submits and the sidecar accepts. */
+  onGrepApplied: (grep: string) => void;
 };
 
 const measureHeight = (el: Element) => el.getBoundingClientRect().height;
@@ -277,15 +279,16 @@ function Rows({
 /** What the viewer draws from the core's state; the visible range is the viewport's alone. */
 const VIEWER_FIELDS = ['loading', 'failed', 'ended', 'notices'] as const;
 
-export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport }: LogViewerProps) {
-  // Built once per mount; it opens nothing until the core asks.
+export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport, onGrepApplied }: LogViewerProps) {
+  // Built once per mount, and again per accepted grep; it opens nothing until the core asks.
   const urql = useClient();
   const [error, setError] = useState<string | null>(null);
-  const [client] = useState(() => watchClient(createLogsClient(urql, clusterId, query), setError));
+  const [client, setClient] = useState(() => watchClient(createLogsClient(urql, clusterId, query), setError));
 
   const [store] = useState(createCoreStore);
   const state = useCoreFields(store, VIEWER_FIELDS);
   const core = useRef<CoreHandle>(null);
+
   const [columns, setColumns] = useLogViewerColumns();
   const template = useMemo(() => gridTemplate(columns), [columns]);
   const widths = useMeasureWidths();
@@ -304,13 +307,22 @@ export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport }: LogV
     core.current?.measure();
   };
 
-  // The range moves with the store, the selection with the rows and the pause with
-  // the toolbar; each write carries all three.
+  // The range moves with the store, the selection with the rows, and the pause and the
+  // grep with the toolbar; each write carries all four.
   const selection = useRef<LogLine[]>([]);
   const pausedNow = useRef(false);
+  const grepNow = useRef(query.grep);
   const writeViewport = useCallback(() => {
     const { range, atEnd, pinnedToEnd, visible } = store.getSnapshot();
-    viewport.set({ range, atEnd, pinnedToEnd, paused: pausedNow.current, visible, selection: selection.current });
+    viewport.set({
+      range,
+      atEnd,
+      pinnedToEnd,
+      paused: pausedNow.current,
+      visible,
+      grep: grepNow.current,
+      selection: selection.current,
+    });
   }, [store, viewport]);
   const onPausedChange = (next: boolean) => {
     setPaused(next);
@@ -325,6 +337,44 @@ export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport }: LogV
     [writeViewport],
   );
 
+  // The grep in effect. A submitted one takes over only once the sidecar accepts it, so a
+  // refused pattern leaves the last good view in place. Submissions can overlap; the latest
+  // alone counts.
+  const [grep, setGrep] = useState(query.grep);
+  const [grepError, setGrepError] = useState<string | null>(null);
+  const submissions = useRef(0);
+  const onGrepChange = (next: string) => {
+    submissions.current += 1;
+    // The grep in effect needs no read and no landing; submitting it drops a pending one.
+    if (next === grep) {
+      setGrepError(null);
+      return;
+    }
+    const mine = submissions.current;
+    const candidate = createLogsClient(urql, clusterId, { ...query, grep: next });
+    // The sidecar compiles a grep before it reads, so a one-line read says whether it holds.
+    candidate.fetch({ kind: 'Last', limit: 1 }).then(
+      () => {
+        if (mine !== submissions.current) return;
+        setGrep(next);
+        setGrepError(null);
+        setClient(watchClient(candidate, setError));
+        onGrepApplied(next);
+        // The landing writes the viewport as it publishes, so no write pairs the old
+        // lines with the new grep. It mounts a fresh selection.
+        grepNow.current = next;
+        selection.current = [];
+        // The new client lands as the last landing did; jump to where the user is now instead.
+        const { range, pinnedToEnd } = store.getSnapshot();
+        if (pinnedToEnd) core.current?.jumpTo({ kind: 'Tail', at: null });
+        else if (range !== null) core.current?.jumpTo({ kind: 'At', at: range.from });
+      },
+      (refused: unknown) => {
+        if (mine === submissions.current) setGrepError(errorText(refused));
+      },
+    );
+  };
+
   // A closed view leaves no range behind for the composer to pull.
   useEffect(() => {
     writeViewport();
@@ -334,6 +384,14 @@ export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport }: LogV
       viewport.set(EMPTY_LOG_VIEWPORT);
     };
   }, [store, viewport, writeViewport]);
+  // Nor a pending grep to write one back: the handle outlives the viewer, and the next
+  // view's viewer shares it.
+  useEffect(
+    () => () => {
+      submissions.current += 1;
+    },
+    [],
+  );
 
   const muted = 'border-b px-3 py-1 text-xs text-muted-foreground';
   return (
@@ -343,12 +401,15 @@ export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport }: LogV
         paused={paused}
         columns={columns}
         wrap={wrap}
+        grep={grep}
+        grepError={grepError}
         onJumpTo={(at) => core.current?.jumpTo({ kind: 'At', at: at.toISOString() })}
         onStart={() => core.current?.jumpTo({ kind: 'Head', at: null })}
         onEnd={() => core.current?.jumpTo({ kind: 'Tail', at: null })}
         onPausedChange={onPausedChange}
         onColumnsChange={setColumns}
         onWrapChange={setWrap}
+        onGrepChange={onGrepChange}
       />
       {state.notices.map(({ code, message }) => (
         <p key={`${code}:${message}`} className={muted} title={code}>
