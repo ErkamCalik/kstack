@@ -315,8 +315,8 @@ type ToolCall struct {
 	ID        ToolCallID `json:"id"`
 	ToolUseID string     `json:"toolUseID"`
 	Name      string     `json:"name"`
-	// Contract is the vendor's own identifier for the shape the call uses; "" for
-	// a tool of ours.
+	// Contract is the shape the call's stored JSON is in; "" for a call of a tool
+	// the box did not hold.
 	Contract  string          `json:"contract"`
 	Arguments rawjson.RawJSON `json:"arguments"`
 	Status    ToolCallStatus  `json:"status"`
@@ -350,11 +350,12 @@ type ToolCall struct {
 // user's decision on it, as the wire serves them: the request as sent, and the
 // action the proxy classified it as. ContentType and Body are empty once it
 // no longer waits, since each publish sends the call list whole; the record
-// keeps them. An action with no write serves an empty request.
+// keeps them. An action with no write serves an empty request, and one whose
+// stored request this build cannot read serves no action as well.
 type ClusterWrite struct {
 	Approval ToolCallApproval `json:"approval"`
 	tools.ClusterWrite
-	Action PermissionAction `json:"action"`
+	Action *PermissionAction `json:"action"`
 	// Diff is the change as YAML while the write waits; DiffCut says it stops
 	// short of the whole change, and DiffError why there is none.
 	Diff      string `json:"diff"`
@@ -375,11 +376,14 @@ type PermissionAction struct {
 }
 
 // clusterWriteOf is an action approval as the wire serves it, the request
-// whole.
-func clusterWriteOf(a ToolCallApproval, r tools.ActionRequest) ClusterWrite {
+// whole: the approval alone when r is nil, a request this build cannot read.
+func clusterWriteOf(a ToolCallApproval, r *tools.ActionRequest) ClusterWrite {
+	if r == nil {
+		return ClusterWrite{Approval: a}
+	}
 	w := ClusterWrite{
 		Approval: a,
-		Action:   PermissionAction{Action: r.Action, Grantable: r.Grantable, CommandRule: r.CommandRule, ChatRule: r.ChatRule},
+		Action:   &PermissionAction{Action: r.Action, Grantable: r.Grantable, CommandRule: r.CommandRule, ChatRule: r.ChatRule},
 		Diff:     r.Diff, DiffCut: r.DiffCut, DiffError: r.DiffError,
 	}
 	if r.Write != nil {
@@ -393,7 +397,7 @@ func clusterWriteOf(a ToolCallApproval, r tools.ActionRequest) ClusterWrite {
 func clusterWritesOf(r toolCallEntry) []ClusterWrite {
 	out := make([]ClusterWrite, 0, len(r.ClusterWrites))
 	for _, a := range r.ClusterWrites {
-		w := clusterWriteOf(toolCallApprovalOf(a), *a.Request)
+		w := clusterWriteOf(toolCallApprovalOf(a), a.Request)
 		if a.Reason != "" {
 			w.Reason = &a.Reason
 		}
@@ -446,8 +450,10 @@ var backgroundTaskStatuses = map[string]BackgroundTaskStatus{
 	taskStopped: BackgroundTaskStopped, taskLost: BackgroundTaskLost,
 }
 
-// backgroundTaskOf is a task's row as the wire serves it.
-func backgroundTaskOf(t *taskState) *BackgroundTask {
+// backgroundTaskOf is the task's row of call r as the wire serves it, a watch's
+// result read through box.
+func backgroundTaskOf(box tools.Box, r toolCallEntry) *BackgroundTask {
+	t := r.Task
 	if t == nil {
 		return nil
 	}
@@ -459,12 +465,11 @@ func backgroundTaskOf(t *taskState) *BackgroundTask {
 		b.ExitCode = &code
 	}
 	if t.Result != "" {
-		r, err := watchResultOf(t.Result)
-		if err != nil {
-			slog.Warn("could not read a watch's result", "err", err)
+		w, ok := watchResultOf(box, r, t.Result)
+		if !ok {
 			return b
 		}
-		b.Matched, b.EndedBecause, b.ViewAround = r.Lines, r.EndedBecause, r.ViewAround
+		b.Matched, b.EndedBecause, b.ViewAround = w.Lines, w.EndedBecause, w.ViewAround
 	}
 	return b
 }
@@ -502,7 +507,7 @@ func marshalToolCalls(rows []toolCallEntry, box tools.Box) rawjson.RawJSON {
 		c := ToolCall{
 			ID: r.ID, ToolUseID: r.ToolUseID, Name: r.Name, Contract: r.Contract, Arguments: argumentsJSON(r.Arguments),
 			Status: status, RunsOn: runsOn, ActionKind: actionKindOf(box, r), Action: actionOf(box, r),
-			Output: r.Result, IsError: r.Error != "", Background: backgroundTaskOf(r.Task),
+			Output: r.Result, IsError: r.Error != "", Background: backgroundTaskOf(box, r),
 			ClusterWrites: clusterWritesOf(r), Network: toolCallNetworkOf(r.Network),
 		}
 		if a := r.Approval; a != nil {
@@ -523,15 +528,28 @@ func marshalToolCalls(rows []toolCallEntry, box tools.Box) rawjson.RawJSON {
 
 // actionOf is what a stored call does: the action its run showed, else its
 // arguments read through box, and nil when nothing reads them (tools.Box.Action).
+// A shown action the box refuses is no action, and one warning.
 func actionOf(box tools.Box, r toolCallEntry) *tools.Action {
-	if r.Shown != nil {
-		return r.Shown
+	contract := tools.ContractName(r.Contract)
+	if r.Shown != "" {
+		a, err := box.Shown(r.Name, contract, json.RawMessage(r.Shown))
+		if err != nil {
+			warnRefused(r.ID, "shown_action", err)
+			return nil
+		}
+		return &a
 	}
-	a, ok := box.Action(r.Name, json.RawMessage(r.Arguments), r.Cwd, r.Sandboxed)
+	a, ok := box.Action(r.Name, contract, json.RawMessage(r.Arguments), r.Cwd, r.Sandboxed)
 	if !ok {
 		return nil
 	}
 	return &a
+}
+
+// warnRefused logs a stored payload of call the box refused: which payload, and
+// the sentinel alone, since a decoder's error can quote the row.
+func warnRefused(call ToolCallID, payload string, err error) {
+	slog.Warn("could not read a call's stored json", "call", string(call), "payload", payload, "err", err)
 }
 
 // actionKindOf is a stored call's kind, read through box, and nil when nothing

@@ -50,7 +50,7 @@ func TestTheFileToolsAreOfferedWithoutAShell(t *testing.T) {
 	assert.Equal(t, []string{"Read", "Memory", "Write", "Edit", "WebFetch", "TaskStop", "Agent", "KubeQuery", "LogsView", "LogsRead", "LogsWatch"}, definitionNames(defs))
 	require.Len(t, native, 1)
 	assert.Equal(t, anthropicwebsearch.Name, native[0].Tool.Name())
-	got, ok := box.Action(bash.Name, json.RawMessage(`{"command":"ls"}`), "/srv", false)
+	got, ok := box.Action(bash.Name, bash.ContractName, json.RawMessage(`{"command":"ls"}`), "/srv", false)
 	assert.True(t, ok, "a stored bash call still shows")
 	assert.Equal(t, "ls", got.Command.Text)
 }
@@ -194,6 +194,19 @@ func TestEveryToolIsOnAList(t *testing.T) {
 
 	for _, name := range offerNames(everyTool(t)) {
 		assert.True(t, listed[name], name)
+	}
+}
+
+// Every tool of ours answers a contract of the form `<name>/v<n>`, its name
+// lower-cased; NewBox holds them unique.
+func TestEveryToolOfOursHasAContractOfItsForm(t *testing.T) {
+	box := everyTool(t)
+	defs, _ := box.Offer()
+
+	for _, name := range definitionNames(defs) {
+		c := box.ContractOf(name)
+		assert.Regexp(t, `^[a-z]+/v[1-9][0-9]*$`, string(c), name)
+		assert.True(t, strings.HasPrefix(string(c), strings.ToLower(name)+"/"), name)
 	}
 }
 

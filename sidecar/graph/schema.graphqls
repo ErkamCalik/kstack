@@ -1086,7 +1086,7 @@ type ToolCall {
   toolUseID: String!
   "The tool's name in the box: a tool of ours by the name it is offered under, a vendor's by its own name."
   name: String!
-  "The vendor's own identifier for the shape the call uses (`web_search_20260318`). Empty for a tool of ours."
+  "The shape the call's arguments, shown action and task result are in: `bash/v1` for a tool of ours, the vendor's own identifier (`web_search_20260318`) for a vendor's. Empty for a call of a tool this build does not know."
   contract: String!
   "The call's input, as the model sent it."
   arguments: JSON!
@@ -1120,8 +1120,8 @@ and its call `Running`.
 """
 type ClusterWrite {
   approval: ToolCallApproval!
-  "The action the request is, as the sidecar's classifier read it."
-  action: PermissionAction!
+  "The action the request is, as the sidecar's classifier read it. Null when this build cannot read the stored request; `method` and `path` are then empty, and the write offers Deny alone."
+  action: PermissionAction
   "The change as YAML, a unified diff of the object now against the dry run's answer, while the write waits; empty otherwise, and for a create or a delete."
   diff: String!
   "Whether the diff was cut short of the whole change. The request then draws the raw request open, and Approve waits on it."

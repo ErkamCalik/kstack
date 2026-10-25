@@ -29,11 +29,15 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/appdb"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/apimeta"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/rawjson"
+	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlstmt"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/testutil"
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
+	"github.com/kstackhq/kstack/sidecar/internal/run/permissions"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/anthropicwebsearch"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/bash"
+	"github.com/kstackhq/kstack/sidecar/internal/tools/logsview"
+	"github.com/kstackhq/kstack/sidecar/internal/tools/logswatch"
 )
 
 // Every row helper names the statement that failed. A closed pool is the one
@@ -714,7 +718,7 @@ func TestToolCallsMatchTheStoredRead(t *testing.T) {
 	describedArgs, _ := json.Marshal(map[string]string{"command": odd, "description": oddDescription})
 	row := func(seq int, status, result, errText string, start sql.NullInt64) toolCallEntry {
 		return toolCallEntry{
-			ID: newToolCallID(), LLMCallID: call.ID, Seq: seq, Name: bash.Name, ToolUseID: "toolu_" + string(rune('a'+seq)),
+			ID: newToolCallID(), LLMCallID: call.ID, Seq: seq, Name: bash.Name, Contract: string(bash.ContractName), ToolUseID: "toolu_" + string(rune('a'+seq)),
 			Arguments: args, Result: result, Error: errText, Status: status, CreatedAt: now,
 			StartedAt: start, FinishedAt: finished,
 		}
@@ -886,8 +890,8 @@ func TestATaskRowTakesAnAgentsEnds(t *testing.T) {
 	turn := seedTurn(t, db, c.ID, now)
 	for _, q := range []string{
 		`INSERT INTO llm_calls (id, run_id, seq, provider, model, started_at) VALUES ('l', '` + string(turn.Run) + `', 0, 'fake', 'fake', 0)`,
-		`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, tool_use_id, arguments, status, created_at)
-		 VALUES ('t', 'l', 0, 'Agent', 'call-1', '{}', 'running', 0)`,
+		`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, contract_name, tool_use_id, arguments, status, created_at)
+		 VALUES ('t', 'l', 0, 'Agent', 'agent/v1', 'call-1', '{}', 'running', 0)`,
 	} {
 		_, err := db.Write.Exec(q)
 		require.NoError(t, err, q)
@@ -916,8 +920,8 @@ func TestATaskRowTakesAWatchsEndWithItsResult(t *testing.T) {
 	turn := seedTurn(t, db, c.ID, now)
 	for _, q := range []string{
 		`INSERT INTO llm_calls (id, run_id, seq, provider, model, started_at) VALUES ('l', '` + string(turn.Run) + `', 0, 'fake', 'fake', 0)`,
-		`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, tool_use_id, arguments, status, created_at)
-		 VALUES ('t', 'l', 0, 'LogsWatch', 'call-1', '{}', 'running', 0)`,
+		`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, contract_name, tool_use_id, arguments, status, created_at)
+		 VALUES ('t', 'l', 0, 'LogsWatch', 'logswatch/v1', 'call-1', '{}', 'running', 0)`,
 	} {
 		_, err := db.Write.Exec(q)
 		require.NoError(t, err, q)
@@ -978,8 +982,8 @@ func TestTheActionCarriesTheRowsFlag(t *testing.T) {
 	settleSeededRun(t, db, turn.Run, RunSucceeded, now)
 	for _, q := range []string{
 		`INSERT INTO llm_calls (id, run_id, seq, provider, model, started_at, finished_at) VALUES ('l', '` + string(turn.Run) + `', 0, 'fake', 'fake', 0, 0)`,
-		`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, tool_use_id, arguments, cwd, sandboxed, status, created_at, started_at, finished_at)
-		 VALUES ('t', 'l', 0, 'Bash', 'call-1', '{"command":"make serve","run_in_background":true}', '/work', 1, 'succeeded', 0, 0, 0)`,
+		`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, contract_name, tool_use_id, arguments, cwd, sandboxed, status, created_at, started_at, finished_at)
+		 VALUES ('t', 'l', 0, 'Bash', 'bash/v1', 'call-1', '{"command":"make serve","run_in_background":true}', '/work', 1, 'succeeded', 0, 0, 0)`,
 		`INSERT INTO background_tasks (id, chat_id, tool_call_id, output_path, status, exit_code, started_at, finished_at)
 		 VALUES ('task-1', '` + string(c.ID) + `', 't', '/r/task-1.output', 'exited', 0, 0, 1)`,
 	} {
@@ -1001,12 +1005,13 @@ func TestTheActionCarriesTheRowsFlag(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, notices, 1)
 	assert.Equal(t, []bool{true}, seen, "the task-notice read")
+	assert.Equal(t, "make serve", notices[0].command, "read under the row's contract")
 }
 
 // sidecarRow is a sidecar call's running row under callID.
 func sidecarRow(callID LLMCallID) toolCallEntry {
 	return toolCallEntry{
-		ID: newToolCallID(), LLMCallID: callID, Name: "Bash", Arguments: `{"command":"kubectl delete pod x"}`,
+		ID: newToolCallID(), LLMCallID: callID, Name: bash.Name, Contract: string(bash.ContractName), Arguments: `{"command":"kubectl delete pod x"}`,
 		Status: toolRunning, CreatedAt: time.UnixMilli(2_000).UTC(),
 	}
 }
@@ -1133,4 +1138,216 @@ func TestTheApprovalChecksHold(t *testing.T) {
 	}
 	assert.NoError(t, insert("action", "{}", "approved", "chat"))
 	assert.NoError(t, insert("call", nil, "approved", "once"))
+}
+
+// viewBox reads LogsView's calls, as the service's box does.
+var viewBox = tools.NewBox(nil, &logsview.Tool{})
+
+// seedShownView is a settled LogsView call in a new chat whose shown_action is
+// stored, returning the chat and the call.
+func seedShownView(t *testing.T, db *appdb.DB, stored string) (ChatID, ToolCallID) {
+	t.Helper()
+	c := seedChat(t, db, aChat("1", time.Now()))
+	id := seedViewCall(t, db, c.ID, "call-1", nil)
+	_, err := db.Write.Exec(`UPDATE tool_calls SET shown_action = ? WHERE id = ?`, stored, string(id))
+	require.NoError(t, err)
+	return c.ID, id
+}
+
+// A shown action that does not decode costs its call the action, not the chat
+// its read: the call shows its kind, and its view does not open.
+func TestAShownActionThatDoesNotDecodeCostsItsCallAlone(t *testing.T) {
+	t.Parallel()
+
+	db := openTestDB(t, t.TempDir())
+	set := prepareOn(t, db)
+	chatID, id := seedShownView(t, db, `{"logsView":7}`)
+
+	msgs, err := listMessages(t.Context(), set.Stmts(), chatID, viewBox)
+	require.NoError(t, err)
+	calls := toolCallsOf(t, msgs[1])
+	require.Len(t, calls, 1)
+	assert.Nil(t, calls[0].Action)
+	assert.Equal(t, new(tools.ActionLogsView), calls[0].ActionKind)
+	_, _, ok, err := viewCall(t.Context(), set.Stmts(), viewBox, chatID, id)
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
+// A refused shown action logs its sentinel and none of the stored text.
+func TestARefusedShownActionLogsNoneOfTheRow(t *testing.T) {
+	// CaptureLogs swaps the process's default logger, so this test stays serial.
+
+	db := openTestDB(t, t.TempDir())
+	set := prepareOn(t, db)
+	chatID, _ := seedShownView(t, db, `{"logsView":{"resolvedAt":"MARKER-5f3a"}}`)
+	logs := testutil.CaptureLogs(t)
+
+	_, err := listMessages(t.Context(), set.Stmts(), chatID, viewBox)
+	require.NoError(t, err)
+
+	assert.Contains(t, logs.String(), tools.ErrDecode.Error())
+	assert.Contains(t, logs.String(), "shown_action")
+	assert.NotContains(t, logs.String(), "MARKER")
+}
+
+// seedWatch is a matched LogsWatch call in a new chat whose task's result is
+// stored, under contract, returning the chat and the call.
+func seedWatch(t *testing.T, db *appdb.DB, contract, stored string) (ChatID, ToolCallID) {
+	t.Helper()
+	c := seedChat(t, db, aChat("1", time.Now()))
+	around := readWebapp().ViewAround
+	id := seedViewCall(t, db, c.ID, "call-1", &tools.Action{LogsWatch: &tools.LogsWatchAction{LogsScopeInput: around.LogsScopeInput, Limit: 1}})
+	seedWatchTask(t, db, c.ID, id, taskMatched, nil)
+	_, err := db.Write.Exec(`UPDATE tool_calls SET contract_name = ? WHERE id = ?`, contract, string(id))
+	require.NoError(t, err)
+	_, err = db.Write.Exec(`UPDATE background_tasks SET result = ? WHERE tool_call_id = ?`, stored, string(id))
+	require.NoError(t, err)
+	return c.ID, id
+}
+
+// watchReads is what the transcript, the notices and the view read of a watch:
+// its matched lines, its notice's text and count, and whether its view opens.
+func watchReads(t *testing.T, set *sqlstmt.Set[stmtID], chatID ChatID, id ToolCallID) (matched int, notice llm.TaskNotice, viewed bool) {
+	t.Helper()
+	st := set.Stmts()
+	msgs, err := listMessages(t.Context(), st, chatID, testReaders)
+	require.NoError(t, err)
+	calls := toolCallsOf(t, msgs[1])
+	require.Len(t, calls, 1)
+	require.NotNil(t, calls[0].Background)
+	waiting, err := waitingNotices(t.Context(), st, chatID, testReaders)
+	require.NoError(t, err)
+	require.Len(t, waiting, 1)
+	_, _, viewed, err = viewCall(t.Context(), st, testReaders, chatID, id)
+	require.NoError(t, err)
+	return len(calls[0].Background.Matched), noticeOf(waiting[0]), viewed
+}
+
+// A watch's result is read under its call's contract alone: one that does not
+// decode, or one under a contract this build does not know, is no lines, no
+// notice text and no view, and the chat still loads.
+func TestAWatchsResultIsReadUnderItsCallsContract(t *testing.T) {
+	t.Parallel()
+
+	result, err := json.Marshal(tools.WatchResult{Text: "1 line", Lines: []tools.LogsReadLine{{Message: "boom"}}, ViewAround: readWebapp().ViewAround})
+	require.NoError(t, err)
+
+	db := openTestDB(t, t.TempDir())
+	set := prepareOn(t, db)
+	chatID, id := seedWatch(t, db, string(logswatch.ContractName), string(result))
+	matched, notice, viewed := watchReads(t, set, chatID, id)
+	assert.Equal(t, 1, matched)
+	assert.Equal(t, "1 line", notice.Result)
+	assert.Equal(t, 1, notice.Matched)
+	assert.True(t, viewed)
+
+	for name, c := range map[string]struct{ contract, stored string }{
+		"a result that does not decode": {string(logswatch.ContractName), `{"text":1}`},
+		"a contract this build lacks":   {"logswatch/v999", string(result)},
+	} {
+		db := openTestDB(t, t.TempDir())
+		set := prepareOn(t, db)
+		chatID, id := seedWatch(t, db, c.contract, c.stored)
+		matched, notice, viewed := watchReads(t, set, chatID, id)
+		assert.Zero(t, matched, name)
+		assert.Empty(t, notice.Result, name)
+		assert.Zero(t, notice.Matched, name)
+		assert.False(t, viewed, name)
+	}
+}
+
+// A refused watch result logs its sentinel and none of the stored text.
+func TestARefusedWatchResultLogsNoneOfTheRow(t *testing.T) {
+	// CaptureLogs swaps the process's default logger, so this test stays serial.
+
+	db := openTestDB(t, t.TempDir())
+	set := prepareOn(t, db)
+	chatID, _ := seedWatch(t, db, string(logswatch.ContractName), `{"text":"t","viewAround":{"resolvedAt":"MARKER-5f3a"}}`)
+	logs := testutil.CaptureLogs(t)
+
+	_, err := listMessages(t.Context(), set.Stmts(), chatID, testReaders)
+	require.NoError(t, err)
+
+	assert.Contains(t, logs.String(), tools.ErrDecode.Error())
+	assert.Contains(t, logs.String(), `"result"`)
+	assert.NotContains(t, logs.String(), "MARKER")
+}
+
+// readStoredWrite is a running Bash call with one cluster write of status, its
+// request stored as given, and answers the write as the run's read serves it.
+func readStoredWrite(t *testing.T, status ApprovalStatus, stored string) ClusterWrite {
+	t.Helper()
+	db := openTestDB(t, t.TempDir())
+	st := prepareOn(t, db).Stmts()
+	callID := seedLLMCall(t, db, st)
+	row := sidecarRow(callID)
+	require.NoError(t, upsertToolCall(t.Context(), st, row))
+	var decided any
+	if status != ApprovalPending {
+		decided = int64(4_000)
+	}
+	_, err := db.Write.Exec(`INSERT INTO approvals (id, tool_call_id, kind, request, status, created_at, decided_at)
+		VALUES (?, ?, 'action', ?, ?, 3000, ?)`, string(newApprovalID()), string(row.ID), stored, string(status), decided)
+	require.NoError(t, err)
+
+	var runID RunID
+	require.NoError(t, db.Read.QueryRow(`SELECT run_id FROM llm_calls WHERE id = ?`, string(callID)).Scan(&runID))
+	byRun, err := toolCallsByRun(t.Context(), st, runCallReads, string(runID))
+	require.NoError(t, err)
+	calls := toolCallsOf(t, ChatMessage{ToolCalls: marshalToolCalls(byRun[runID], testReaders)})
+	require.Len(t, calls, 1)
+	require.Len(t, calls[0].ClusterWrites, 1)
+	return calls[0].ClusterWrites[0]
+}
+
+// Stored cluster writes read the same forever: never edit this table. Its
+// shape is the gate's, not a tool's.
+func TestClusterWritesReadOldRowsTheSame(t *testing.T) {
+	t.Parallel()
+
+	for stored, want := range map[string]ClusterWrite{
+		`{"action":{"class":5,"context":"prod","namespace":"web","verb":"delete","group":"core","kind":"pods","name":"x","summary":"Delete pod web/x","dryRun":false},"grantable":false,"commandRule":"","chatRule":"","write":{"method":"DELETE","path":"/api/v1/namespaces/web/pods/x","subresource":"","contentType":"","body":"","dryRun":false},"diff":"","diffCut":false,"diffError":""}`: {
+			ClusterWrite: tools.ClusterWrite{Method: "DELETE", Path: "/api/v1/namespaces/web/pods/x"},
+			Action: &PermissionAction{Action: permissions.Action{
+				Class: permissions.Destructive, Context: "prod", Namespace: "web", Verb: "delete", Group: "core", Kind: "pods", Name: "x", Summary: "Delete pod web/x",
+			}},
+		},
+		`{"action":{"class":4,"context":"prod","namespace":"web","verb":"patch","group":"apps","kind":"deployments/scale","name":"api","summary":"Scale deployment web/api","dryRun":false},"grantable":true,"commandRule":"patch deployments/scale in web","chatRule":"patch deployments/scale in web","write":{"method":"PATCH","path":"/apis/apps/v1/namespaces/web/deployments/api/scale","subresource":"scale","contentType":"application/merge-patch+json","body":"{\"spec\":{\"replicas\":3}}","dryRun":false},"diff":"-replicas: 1\n+replicas: 3\n","diffCut":false,"diffError":""}`: {
+			ClusterWrite: tools.ClusterWrite{
+				Method: "PATCH", Path: "/apis/apps/v1/namespaces/web/deployments/api/scale", Subresource: "scale",
+				ContentType: "application/merge-patch+json", Body: `{"spec":{"replicas":3}}`,
+			},
+			Action: &PermissionAction{
+				Action: permissions.Action{
+					Class: permissions.UpstreamWrite, Context: "prod", Namespace: "web", Verb: "patch", Group: "apps", Kind: "deployments/scale", Name: "api",
+					Summary: "Scale deployment web/api",
+				},
+				Grantable: true, CommandRule: "patch deployments/scale in web", ChatRule: "patch deployments/scale in web",
+			},
+			Diff: "-replicas: 1\n+replicas: 3\n",
+		},
+	} {
+		got := readStoredWrite(t, ApprovalPending, stored)
+		want.Approval = got.Approval
+		assert.Equal(t, want, got, stored)
+	}
+}
+
+// A cluster write whose request does not decode keeps its row: its approval is
+// served whole, with no action and no request, and the warning quotes none of
+// it.
+func TestAnUnreadableClusterWriteKeepsItsApproval(t *testing.T) {
+	// CaptureLogs swaps the process's default logger, so this test stays serial.
+
+	logs := testutil.CaptureLogs(t)
+	got := readStoredWrite(t, ApprovalDenied, `{"action":{"summary":"MARKER-5f3a"`)
+
+	assert.Nil(t, got.Action)
+	assert.Empty(t, got.Method)
+	assert.Empty(t, got.Path)
+	assert.Equal(t, ApprovalDenied, got.Approval.Status)
+	assert.Contains(t, logs.String(), tools.ErrDecode.Error())
+	assert.Contains(t, logs.String(), `"request"`)
+	assert.NotContains(t, logs.String(), "MARKER")
 }

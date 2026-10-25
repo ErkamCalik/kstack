@@ -44,6 +44,9 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/anthropicwebsearch"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/bash"
+	"github.com/kstackhq/kstack/sidecar/internal/tools/logsread"
+	"github.com/kstackhq/kstack/sidecar/internal/tools/logsview"
+	"github.com/kstackhq/kstack/sidecar/internal/tools/logswatch"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/read"
 )
 
@@ -231,12 +234,15 @@ func startServiceOn(t *testing.T, table []sqlstmt.Statement) *service {
 // testSearch is the search the chat tests offer, its prompt naming March 2026.
 var testSearch = anthropicwebsearch.New(func() time.Time { return time.Date(2026, time.March, 15, 12, 0, 0, 0, time.UTC) })
 
-// testReaders offers nothing and reads calls the way production does: bash's,
-// Read's and the search's.
-var testReaders = tools.NewBox(nil, bash.Reader{}, &read.Tool{}, testSearch)
+// ourReaders reads the calls of bash, Read and the log tools, as production does.
+var ourReaders = []tools.Reader{bash.Reader{}, &read.Tool{}, &logsview.Tool{}, &logsread.Tool{}, &logswatch.Tool{}}
 
-// testBox offers the tools given, then the search, and reads bash's and Read's
-// calls where it does not offer them. The lists name every tool it offers.
+// testReaders offers nothing and reads calls the way production does: ours,
+// and the search's.
+var testReaders = tools.NewBox(nil, append(slices.Clone(ourReaders), testSearch)...)
+
+// testBox offers the tools given, then the search, and reads ourReaders' calls
+// where it does not offer them. The lists name every tool it offers.
 func testBox(offered ...tools.Tool) (tools.Box, stubLists) {
 	all := append(slices.Clone(offered), tools.Tool(testSearch))
 	var readers []tools.Reader
@@ -244,7 +250,7 @@ func testBox(offered ...tools.Tool) (tools.Box, stubLists) {
 	for _, t := range all {
 		names = append(names, t.Name())
 	}
-	for _, r := range []tools.Reader{bash.Reader{}, &read.Tool{}} {
+	for _, r := range ourReaders {
 		if !slices.Contains(names, r.Name()) {
 			readers = append(readers, r)
 		}
@@ -527,7 +533,10 @@ func (e testTool) Definition() llm.ToolDefinition {
 
 func (e testTool) Prompt() string { return "## " + e.name + "\n\nSays back what it is given." }
 
-func (e testTool) Name() string                 { return e.name }
+func (e testTool) Name() string { return e.name }
+func (e testTool) ContractName() tools.ContractName {
+	return tools.ContractName(strings.ToLower(e.name) + "/v1")
+}
 func (e testTool) ActionKind() tools.ActionKind { return tools.ActionCommand }
 func (e testTool) Action(input json.RawMessage, _ string, _ bool) (tools.Action, error) {
 	return tools.Action{Command: &tools.CommandAction{Text: string(input)}}, nil
@@ -566,8 +575,7 @@ type storedToolCall struct {
 	result, errText, status string
 	hasStarted, hasFinished bool
 	llmCallSeq              int
-	// provider is a row the provider ran, and contract its contract_name, so every
-	// sidecar row's literal leaves both out.
+	// provider is a row the provider ran, and contract its contract_name.
 	provider bool
 	contract string
 }

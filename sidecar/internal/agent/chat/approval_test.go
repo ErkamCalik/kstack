@@ -638,8 +638,8 @@ func seedWait(t *testing.T, db *appdb.DB, chatID ChatID, command, content string
 	args, _ := json.Marshal(map[string]string{"command": command})
 	_, err = db.Write.Exec(`INSERT INTO llm_calls (id, run_id, seq, provider, model, started_at) VALUES (?, ?, 0, 'fake', 'fake', 0)`, call, string(turn.Run))
 	require.NoError(t, err)
-	_, err = db.Write.Exec(`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, tool_use_id, arguments, is_mutating, status, created_at)
-		VALUES (?, ?, 0, 'Bash', 'toolu_1', ?, 1, 'awaiting_approval', 0)`, row, call, string(args))
+	_, err = db.Write.Exec(`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, contract_name, tool_use_id, arguments, is_mutating, status, created_at)
+		VALUES (?, ?, 0, 'Bash', 'bash/v1', 'toolu_1', ?, 1, 'awaiting_approval', 0)`, row, call, string(args))
 	require.NoError(t, err)
 	_, err = db.Write.Exec(`INSERT INTO approvals (id, tool_call_id, status, created_at) VALUES (?, ?, 'pending', 0)`, string(id), row)
 	require.NoError(t, err)
@@ -1115,7 +1115,7 @@ func TestAWriteIsAskedUnderTheRunningCall(t *testing.T) {
 	assert.Nil(t, calls[0].Approval, "the call itself was not asked about")
 	require.Len(t, calls[0].ClusterWrites, 1)
 	w := calls[0].ClusterWrites[0]
-	assert.Equal(t, clusterWriteOf(ToolCallApproval{ID: w.Approval.ID, Status: ApprovalPending}, deleteX), w)
+	assert.Equal(t, clusterWriteOf(ToolCallApproval{ID: w.Approval.ID, Status: ApprovalPending}, &deleteX), w)
 	assert.Equal(t, RunWaitingApproval, runStatusOf(t, s.db, msg.RunID))
 	assert.Equal(t, []approvalRow{{status: ApprovalPending}}, approvalRows(t, s.db))
 
@@ -1125,7 +1125,7 @@ func TestAWriteIsAskedUnderTheRunningCall(t *testing.T) {
 	assert.Equal(t, StatusStreaming, got.Status)
 	w = toolCallsOf(t, got)[0].ClusterWrites[0]
 	once := permissions.DurationOnce
-	decided := clusterWriteOf(ToolCallApproval{ID: w.Approval.ID, Status: ApprovalApproved, Duration: &once}, deleteX)
+	decided := clusterWriteOf(ToolCallApproval{ID: w.Approval.ID, Status: ApprovalApproved, Duration: &once}, &deleteX)
 	decided.ContentType, decided.Body = "", ""
 	assert.Equal(t, decided, w)
 	assert.Equal(t, []approvalRow{{status: ApprovalApproved, decided: true}}, approvalRows(t, s.db))
