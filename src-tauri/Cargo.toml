@@ -145,8 +145,8 @@ objc2-app-kit = { version = "0.3", features = [
 # objc2-foundation's notification-center types receive NSWorkspace's wake
 # notification; system-configuration's SCNetworkReachability (scheduled on a
 # CFRunLoop from core-foundation) reports connectivity transitions.
-system-configuration = "0.6"
-core-foundation = "0.9"
+system-configuration = "0.8"
+core-foundation = "0.10"
 
 # Unix-only: tao installs no signal handlers, so SIGTERM/SIGINT/SIGHUP are
 # captured and funneled into the graceful-exit path (see
@@ -161,15 +161,16 @@ libc = "0.2"
 # Linux-only: the wake/network-return event sources (wake/linux.rs) subscribe to
 # systemd-logind's `PrepareForSleep` signal and NetworkManager's `StateChanged`,
 # both on the system D-Bus bus. `default-features = false` + `tokio` integrates
-# zbus with the app's existing tokio runtime (drops its default async-io stack).
+# zbus with the app's existing tokio runtime (drops its default async-io stack);
+# `proxy` provides the `#[zbus::proxy]` macro.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
 
 # Windows-only: force-terminate the sidecar by pid via TerminateProcess once
 # its CommandChild handle has been dropped (see sidecar::lifecycle). Windows
 # has no POSIX signals, so the graceful path is stdin-EOF instead.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Threading",
   # wake/windows.rs: callback-based resume-from-sleep notification
