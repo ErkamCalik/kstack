@@ -323,7 +323,7 @@ describe('MemoryDialog', () => {
   });
 
   it('keeps the confirm and says so when a delete fails', async () => {
-    deleteMock.mockResolvedValue({ error: new Error('socket closed') });
+    deleteMock.mockResolvedValue({ error: { graphQLErrors: [], message: 'socket closed' } });
     show(memory());
     draw();
     fireEvent.click(screen.getByRole('button', { name: 'Delete pages' }));

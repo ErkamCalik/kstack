@@ -16,7 +16,6 @@
 // listed, read, edited and deleted here. A memory may have been written by the
 // model from cluster data, so every field is drawn as text, never as markdown.
 import { useId, useState } from 'react';
-import { useMutation } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
 import { Field, FieldLabel } from '@kubetail/ui/elements/field';
@@ -25,46 +24,11 @@ import { Spinner } from '@kubetail/ui/elements/spinner';
 import { Textarea } from '@kubetail/ui/elements/textarea';
 
 import { Dialog } from '@/components/widgets/dialog';
-import { graphql } from '@/gql';
 import { useActiveCluster } from '@/lib/active-cluster';
 import type { AppDialogProps } from '@/lib/dialog';
 import { useMemories } from '@/lib/memories';
 import type { Memory } from '@/lib/memories';
-
-const MemorySaveMutation = graphql(`
-  mutation MemorySave($input: MemorySaveInput!) {
-    memorySave(input: $input) {
-      id
-    }
-  }
-`);
-
-const MemoryDeleteMutation = graphql(`
-  mutation MemoryDelete($id: MemoryID!) {
-    memoryDelete(id: $id)
-  }
-`);
-
-// The sidecar's shape rules (tools.CheckMemory), checked here as the user types:
-// its refusal names no field, so the form says which rule a field breaks.
-const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-const NAME_MAX = 48;
-const BODY_MAX_BYTES = 500;
-const NAME_RULE = `Lower-case letters, digits and single hyphens, at most ${NAME_MAX} characters.`;
-const BODY_RULE = `At most ${BODY_MAX_BYTES} bytes.`;
-
-const utf8 = new TextEncoder();
-const nameFits = (name: string) => name.length <= NAME_MAX && NAME_RE.test(name);
-const bodyFits = (body: string) => utf8.encode(body).length <= BODY_MAX_BYTES;
-
-// Why a save was refused, in the dialog's words, by the code the sidecar sent.
-const REFUSALS: Record<string, string> = {
-  KSTACK_RECORD_NOT_FOUND: 'This memory or its cluster is gone.',
-  KSTACK_MEMORY_NAME_TAKEN: 'Another memory here has this name.',
-  KSTACK_MEMORY_FULL: 'There is no room for this memory here. Shorten or delete one first.',
-  KSTACK_MEMORY_SECRET: 'This looks like a credential. Memories never keep one.',
-  KSTACK_VALIDATION_ERROR: `A name is lower-case letters, digits and single hyphens, at most ${NAME_MAX} characters, and a memory is at most ${BODY_MAX_BYTES} bytes.`,
-};
+import { BODY_RULE, NAME_RULE, bodyFits, nameFits, useMemoryWrites } from '@/components/widgets/memory/writes';
 
 type Draft = { name: string; scope: 'cluster' | 'everywhere'; body: string };
 
@@ -79,7 +43,7 @@ type Editing = { memory?: Memory; clusterID: string };
 // One memory as the user writes it. A refused save keeps the draft, and the form
 // is locked while a save is in flight, so nothing typed is lost.
 function MemoryForm({ editing: { memory, clusterID }, onDone }: { editing: Editing; onDone: () => void }) {
-  const [, memorySave] = useMutation(MemorySaveMutation);
+  const { save: memorySave } = useMemoryWrites();
   const [draft, setDraft] = useState<Draft>({
     name: memory?.name ?? '',
     scope: memory && memory.clusterID === null ? 'everywhere' : 'cluster',
@@ -96,17 +60,14 @@ function MemoryForm({ editing: { memory, clusterID }, onDone }: { editing: Editi
   const save = async () => {
     setSaving(true);
     setRefusal('');
-    const result = await memorySave({
-      input: {
-        id: memory?.id ?? null,
-        clusterID: draft.scope === 'cluster' ? (memory?.clusterID ?? clusterID) : null,
-        name: draft.name,
-        body: draft.body,
-      },
+    const refused = await memorySave({
+      id: memory?.id ?? null,
+      clusterID: draft.scope === 'cluster' ? (memory?.clusterID ?? clusterID) : null,
+      name: draft.name,
+      body: draft.body,
     });
-    if (result.error) {
-      const code = result.error.graphQLErrors[0]?.extensions?.code;
-      setRefusal(REFUSALS[String(code)] ?? 'The memory could not be saved.');
+    if (refused) {
+      setRefusal(refused);
       setSaving(false);
       return;
     }
@@ -174,14 +135,13 @@ type RowProps = {
 };
 
 function MemoryRow({ memory, onEdit }: RowProps) {
-  const [, memoryDelete] = useMutation(MemoryDeleteMutation);
+  const { remove: memoryDelete } = useMemoryWrites();
   const [confirming, setConfirming] = useState(false);
   const [failed, setFailed] = useState(false);
   // A failed delete keeps the confirm row, so the user sees why nothing went.
   const remove = async () => {
     setFailed(false);
-    const result = await memoryDelete({ id: memory.id });
-    if (result.error) {
+    if ((await memoryDelete([memory.id])).length > 0) {
       setFailed(true);
       return;
     }
