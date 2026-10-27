@@ -89,12 +89,25 @@ lib → appdb → llm → run → services → tools → agent → app
 
 ## gRPC + GraphQL over one socket (h2c)
 
-`internal/app` owns the topology; `grpc/` owns `IsGRPCRequest`. → [ADR: single-socket
-h2c](../docs/adr/2026-08-09-single-socket-h2c.md).
+`internal/app` owns the topology; `grpc/` owns `IsGRPCRequest`. `main.go`'s `http.Server` speaks
+`app.Protocols()` (HTTP/1.1 plus unencrypted HTTP/2). → [ADR: single-socket h2c from the standard
+library](../docs/adr/2026-10-26-single-socket-h2c-from-the-standard-library.md).
 
-Shutdown (`main.go`): `NotifyShutdown` → `srv.Shutdown` → `DrainWithContext` → `stop` → `Close`.
-Traps: grpc-go's `GracefulStop` **panics** on h2c, so `Stop` runs after the drain; never cancel
-via `http.Server.BaseContext`, which kills the shared connection.
+**Shutdown** (`shutdown.go`): `srv.Shutdown` (stops listening, then its hook runs `CancelStreams`,
+so SSE and gRPC streams end at once; requests get `requestGrace`, 10s) → `CancelStreams` again, since
+`Shutdown` does not wait for its hooks → `CloseRequests` (a later
+request gets a 503; every handler still running is cancelled, and its connection cut if the grace
+ran out) → `WaitRequests` (every HTTP handler, then gRPC `Stop`, which waits for its method
+handlers) → `stop` → `Close`. Each step logs its duration under the name it has in the log:
+`drain requests`, `cancel requests`, `wait requests`, `stop services`, `close services`. One
+watchdog bounds the whole stop at `shutdownBudget` (20s, the grace plus 10s): it removes the
+socket file, logs every goroutine's stack, one record each, and exits 1. Traps: cancel per
+request, never via
+`http.Server.BaseContext`, which kills the shared connection; handlers are joined before `stop`, and
+loops before `Close`, after every `Shutdown`, since `Shutdown` counts streams, not handlers, and a
+gRPC method handler outlives its `ServeHTTP` once the client resets the stream; nothing after the
+grace has a deadline but the watchdog. The host's kill (`SIDECAR_SHUTDOWN_GRACE`) sits above the
+budget.
 
 ## Security invariants
 
@@ -183,7 +196,7 @@ Implement the panicking stubs it appends to `schema.resolvers.go`. **Never hand-
 
 ## Tests & checks
 
-- testify + `httptest`. Resolver tests stand up `graph.NewServer(&graph.Resolver{...})` + `POST /graphql`; lifecycle tests stand up `app.New(...)`. Filesystem via `t.TempDir()`.
+- testify + `httptest`. Resolver tests stand up `graph.NewServer(ctx, &graph.Resolver{...})` + `POST /graphql`; lifecycle tests stand up `app.New(...)`. Filesystem via `t.TempDir()`.
 - A fixture that needs a stored status writes it with `beehive.NewAdminClient`, never by registering a controller. A controller's own writes are asserted by calling `Reconcile` against a stubbed `ControllerClient`.
 - White-box tests by default (`package foo`). External `package foo_test` only to pin a public contract, and say so.
 - No magic sleeps (root `CLAUDE.md`). Wait on channels through `internal/lib/testutil` (`Wait`, `Recv`, `RecvClosed`, `WaitClosed`); the one failsafe is `testutil.Timeout`.

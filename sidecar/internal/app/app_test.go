@@ -211,8 +211,8 @@ func TestEveryToolOfOursHasAContractOfItsForm(t *testing.T) {
 }
 
 // newTestApp builds an App backed by a kubeconfig with two contexts, then serves
-// it over httptest (HTTP/1.1 for GraphQL/SSE, h2c upgrade for gRPC — exactly the
-// production split). It does NOT call Start(), so the cluster-cache coordinator
+// it over httptest (HTTP/1.1 for GraphQL/SSE, prior-knowledge h2c for gRPC —
+// exactly the production split). It does NOT call Start(), so the cluster-cache coordinator
 // never runs; the lifecycle surface is what's under test.
 func newTestApp(t *testing.T) (*App, string) {
 	t.Helper()
@@ -520,16 +520,15 @@ func TestAppAuthStateDegradesSignedOut(t *testing.T) {
 	assert.Contains(t, string(raw), `"authenticated":false`)
 }
 
-// TestAppShutdownDrainsBothTransports is the heart of the lifecycle contract:
-// with a live SSE subscription AND a live gRPC AuthStateWatch stream open,
-// NotifyShutdown signals both to close and DrainWithContext returns nil only once
-// both handlers have unwound. If either transport were left dangling, the GraphQL
-// WaitGroup or the gRPC stream WaitGroup would never reach zero and
-// DrainWithContext would hit its deadline instead.
-func TestAppShutdownDrainsBothTransports(t *testing.T) {
+// TestAppShutdownEndsBothTransports pins main's shutdown order: with a live SSE
+// subscription AND a live gRPC AuthStateWatch stream open, http.Server.Shutdown
+// fires CancelStreams, both streams end cleanly, and Shutdown returns at once.
+// Shutdown waits on the gRPC stream itself, so a stream left dangling would run
+// it into its deadline.
+func TestAppShutdownEndsBothTransports(t *testing.T) {
 	a, _ := newTestApp(t)
-	ts := httptest.NewServer(a)
-	defer ts.Close()
+	ts := serveApp(t, a)
+	ts.Config.RegisterOnShutdown(a.CancelStreams)
 
 	// Live SSE subscription.
 	sseReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/graphql", strings.NewReader(`{"query":"subscription { authStateWatch { authenticated } }"}`))
@@ -558,14 +557,12 @@ func TestAppShutdownDrainsBothTransports(t *testing.T) {
 		grpcRecvErr <- e
 	}()
 
-	// The two-line app shutdown surface main.go drives.
-	a.NotifyShutdown()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	require.NoError(t, a.DrainWithContext(ctx))
+	require.NoError(t, ts.Config.Shutdown(ctx))
 
 	// The gRPC stream ended cleanly (OK trailers → EOF), not cut mid-flight.
-	assert.ErrorIs(t, testutil.Recv(t, grpcRecvErr, "the gRPC Watch to drain"), io.EOF)
+	assert.ErrorIs(t, testutil.Recv(t, grpcRecvErr, "the gRPC Watch to end"), io.EOF)
 }
 
 // A data dir that is not a directory fails at the first subsystem that needs
