@@ -31,7 +31,7 @@ Link by path, name it by slug, never by date alone:
 ## Status
 
 - **Accepted** — in force. This is the only status a `CLAUDE.md` may link to.
-- **Superseded by [<slug>](<path>)** — kept for the record. Nothing outside `docs/adr/` links here.
+- **`Superseded by [<slug>](<path>)`** — kept for the record. Nothing outside `docs/adr/` links here.
 
 Superseding is a normal change, not a failure. Write a new ADR, flip the old one's status, and
 **update every `CLAUDE.md` link in the same commit** — a live doc pointing at a superseded ADR is
