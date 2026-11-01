@@ -1,3 +1,14 @@
 {
-  "recommendations": ["oxc.oxc-vscode", "tauri-apps.tauri-vscode", "rust-lang.rust-analyzer"]
+  "recommendations": [
+    "oxc.oxc-vscode",
+    "dbaeumer.vscode-eslint",
+    "bradlc.vscode-tailwindcss",
+    "graphql.vscode-graphql",
+    "graphql.vscode-graphql-syntax",
+    "vitest.explorer",
+    "golang.go",
+    "rust-lang.rust-analyzer",
+    "tauri-apps.tauri-vscode"
+  ],
+  "unwantedRecommendations": ["esbenp.prettier-vscode"]
 }
