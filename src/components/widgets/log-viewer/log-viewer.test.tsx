@@ -917,7 +917,7 @@ describe('LogViewer', () => {
       selectRows('line 19', 'line 19');
       fireEvent.keyDown(scrollerIn(container), { key: 'c', metaKey: true });
       await act(async () => {});
-      expect(reportError).toHaveBeenCalledWith(expect.objectContaining({ message: 'log viewer: copy: denied' }));
+      expect(reportError).toHaveBeenCalledWith(expect.objectContaining({ message: 'clipboard: write: denied' }));
     });
 
     it('puts the selected lines in the viewport, in order, and empties it on Escape', async () => {

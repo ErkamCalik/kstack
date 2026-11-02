@@ -17,13 +17,15 @@
 // tag in it renders as the literal characters. `react-markdown` leaves raw HTML out
 // unless a rehype plugin puts it back — none is added.
 import { toJsxRuntime } from 'hast-util-to-jsx-runtime';
+import { Check, Copy } from 'lucide-react';
 import { Fragment, useEffect, useState } from 'react';
 import type { ComponentProps } from 'react';
 import { jsx, jsxs } from 'react/jsx-runtime';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 import '@/components/widgets/markdown.css';
+import { copyToClipboard } from '@/lib/clipboard';
 import { highlight, load, loaded } from '@/lib/highlight';
 
 type MarkdownProps = {
@@ -31,6 +33,9 @@ type MarkdownProps = {
 };
 
 const remarkPlugins = [remarkGfm];
+
+// How long a fence's copy button shows the check after a click.
+const COPIED_FOR_MS = 1_500;
 
 // A link is drawn but never followed: the webview has no window to open a page in,
 // and the only URLs the host opens are ones it names itself.
@@ -76,6 +81,49 @@ function Code({ className, children, ...p }: ComponentProps<'code'>) {
   );
 }
 
+type Element = NonNullable<ExtraProps['node']>;
+type Text = Extract<Element['children'][number], { type: 'text' }>;
+
+// A fence's source, read off its hast node. react-markdown always passes the node,
+// and every fence is a `<pre>` over a `<code>` over one text node, an empty one too.
+function fenceSource(pre: Element): string {
+  const code = pre.children[0] as Element;
+  return (code.children[0] as Text).value;
+}
+
+// A fence, with a button that copies its source. The check stays `COPIED_FOR_MS`
+// after the latest click; the count re-arms the timer on every one.
+function CodeBlock({ node, children, ...p }: ComponentProps<'pre'> & ExtraProps) {
+  const [copies, setCopies] = useState(0);
+  useEffect(() => {
+    if (copies === 0) return undefined;
+    const timer = setTimeout(() => setCopies(0), COPIED_FOR_MS);
+    return () => clearTimeout(timer);
+  }, [copies]);
+
+  const copy = () => {
+    copyToClipboard(fenceSource(node!));
+    setCopies((n) => n + 1);
+  };
+  const copied = copies > 0;
+
+  return (
+    <div className="group/code relative my-2 rounded-md bg-muted">
+      <button
+        type="button"
+        aria-label={copied ? 'Copied' : 'Copy code'}
+        className="absolute top-2 right-2 rounded border border-border bg-background/90 p-1.5 text-muted-foreground opacity-0 shadow-sm transition-opacity group-hover/code:opacity-100 group-focus-within/code:opacity-100 hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        onClick={copy}
+      >
+        {copied ? <Check aria-hidden="true" className="size-3.5" /> : <Copy aria-hidden="true" className="size-3.5" />}
+      </button>
+      <pre className="overflow-x-auto py-3 pr-12 pl-3 text-xs [&>code]:bg-transparent [&>code]:p-0" {...p}>
+        {children}
+      </pre>
+    </div>
+  );
+}
+
 const components = {
   a: Link,
   p: (p: ComponentProps<'p'>) => <p className="my-2 first:mt-0 last:mb-0" {...p} />,
@@ -117,9 +165,7 @@ const components = {
   ),
   hr: (p: ComponentProps<'hr'>) => <hr className="my-3 border-border" {...p} />,
   code: Code,
-  pre: (p: ComponentProps<'pre'>) => (
-    <pre className="my-2 overflow-x-auto rounded-md bg-muted p-3 text-xs [&>code]:bg-transparent [&>code]:p-0" {...p} />
-  ),
+  pre: CodeBlock,
   table: (p: ComponentProps<'table'>) => (
     <div className="my-2 overflow-x-auto">
       <table className="w-full border-collapse text-xs" {...p} />

@@ -30,7 +30,7 @@ import {
   useSyncExternalStore,
 } from 'react';
 
-import { reportError } from '@/lib/error-bus';
+import { copyToClipboard } from '@/lib/clipboard';
 import type { CoreRows, LogLine } from '@/lib/log-viewer';
 import { COLUMNS, type Column } from './columns';
 import { lineTime } from './line-time';
@@ -124,16 +124,6 @@ export function formatCellsForCopy(
     })
     .filter((text) => text !== '')
     .join('\n');
-}
-
-export function copyToClipboard(text: string) {
-  navigator.clipboard.writeText(text).catch((error: unknown) =>
-    reportError({
-      source: 'render',
-      message: `log viewer: copy: ${error instanceof Error ? error.message : String(error)}`,
-      cause: error,
-    }),
-  );
 }
 
 /** The row selection after a click on `clickedKey`. */

@@ -24,9 +24,10 @@ import {
   ContextMenuTrigger,
 } from '@kubetail/ui/elements/context-menu';
 
+import { copyToClipboard } from '@/lib/clipboard';
 import type { LogLine } from '@/lib/log-viewer';
 import type { Column } from './columns';
-import { copyToClipboard, getPlainAttribute } from './selection';
+import { getPlainAttribute } from './selection';
 
 function items(line: LogLine, col: Column) {
   switch (col) {

@@ -1042,7 +1042,7 @@ describe('keyboard shortcuts', () => {
     selectRows(result, 0);
     key(scroller, { key: 'c', metaKey: true });
     await act(async () => {});
-    expect(reported).toEqual([expect.objectContaining({ source: 'render', message: 'log viewer: copy: denied' })]);
+    expect(reported).toEqual([expect.objectContaining({ source: 'render', message: 'clipboard: write: denied' })]);
     off();
   });
 
