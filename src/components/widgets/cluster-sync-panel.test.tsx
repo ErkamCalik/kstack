@@ -20,6 +20,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished,
 
 import { clusterRecord, flushWatchesSynchronously, mockTauriCore } from '@/test-utils';
 
+import type { ClusterDetail } from '@/lib/dialog';
+
 // Mocks ---------------------------------------------------------------
 
 // Frames pushed here are asserted on immediately.
@@ -30,8 +32,9 @@ vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
 const { ClustersProvider } = await import('@/lib/clusters');
-const { ClusterSyncPanel, ConnectionDetail } = await import('./cluster-sync-panel');
+const { ClusterSyncPanel, ConnectionDetail, syncReason } = await import('./cluster-sync-panel');
 const { onError } = await import('@/lib/error-bus');
+const { DialogProvider, useDialog } = await import('@/lib/dialog');
 
 // Helpers -------------------------------------------------------------
 
@@ -444,7 +447,10 @@ function pushDiscoveryEvent(ev: {
 // (mounts the schedule subscription).
 function pushSchedule(nextRequeueAt: string | null, probing = false) {
   channelFor('clusterScheduleWatch').onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { clusterScheduleWatch: { nextRequeueAt, probing } } } }),
+    JSON.stringify({
+      type: 'next',
+      payload: { data: { clusterScheduleWatch: { nextRequeueAt, probing, failures: 0 } } },
+    }),
   );
 }
 
@@ -471,6 +477,42 @@ function renderPanel() {
       </ClustersProvider>
     </UrqlProvider>,
   );
+}
+
+// Mounts the panel the way AppDialogs does: only while the provider has it mounted, so
+// the panel reads the open's cluster detail as it mounts.
+function HostedHarness({ detail }: { detail: ClusterDetail }) {
+  const { activeDialog, mountedDialog, openDialog, closeDialog } = useDialog();
+  return (
+    <>
+      <button type="button" onClick={() => openDialog('clusters', detail)}>
+        Details
+      </button>
+      {mountedDialog === 'clusters' && (
+        <ClusterSyncPanel open={activeDialog === 'clusters'} onOpenChange={(open) => !open && closeDialog()} />
+      )}
+    </>
+  );
+}
+
+async function openOnDetail(rows: Row[], detail: ClusterDetail) {
+  const user = userEvent.setup();
+  render(
+    <UrqlProvider value={createGraphqlClient()}>
+      <ClustersProvider>
+        <DialogProvider>
+          <HostedHarness detail={detail} />
+        </DialogProvider>
+      </ClustersProvider>
+    </UrqlProvider>,
+  );
+  await flush();
+  await act(async () => {
+    openStreams();
+    pushClusters(rows);
+  });
+  await user.click(screen.getByRole('button', { name: 'Details' }));
+  return user;
 }
 
 // Render the panel, push rows, and open the dialog.
@@ -914,8 +956,7 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByText('Data rate').parentElement).toHaveTextContent('Data rate—');
   });
 
-  // The status popover and the dialog's row both draw ConnectionDetail. A view mounting into a
-  // shared stream would never see the window, so each opens its own.
+  // A view mounting into a shared stream would never see the window, so each opens its own.
   it('gives a second view of one cluster a stream of its own', async () => {
     const client = createGraphqlClient();
     const view = () => (
@@ -1667,6 +1708,34 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
   });
 
+  it('opens on the row and pane it was asked for, scrolled into view', async () => {
+    const scroll = vi.mocked(Element.prototype.scrollIntoView);
+    scroll.mockClear();
+    await openOnDetail(
+      [
+        { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true },
+        { uuid: 'u-dev', name: 'dev-eu', enabled: true, present: true },
+      ],
+      { clusterId: 'u-dev', pane: 'connection' },
+    );
+
+    expect(await screen.findByText(/^connection$/i, { selector: 'p' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /retry/i })).toHaveLength(1);
+    const devRow = screen.getByText('dev-eu').closest('tr')!;
+    expect(within(devRow).getByRole('button', { name: /^active$/i })).toHaveAttribute('aria-expanded', 'true');
+    expect(scroll.mock.contexts).toContain(devRow);
+  });
+
+  it('opens no pane for a cluster it does not list', async () => {
+    await openOnDetail([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true }], {
+      clusterId: 'u-gone',
+      pane: 'connection',
+    });
+
+    await screen.findByRole('rowgroup', { name: /active/i });
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+  });
+
   it('omits a row group that has no members', async () => {
     await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true }]);
     expect(await screen.findByRole('rowgroup', { name: /active/i })).toBeInTheDocument();
@@ -1745,5 +1814,51 @@ describe('ClusterSyncPanel', () => {
       'graphql_query',
       expect.objectContaining({ body: expect.stringContaining('clusterDelete') }),
     );
+  });
+});
+
+describe('syncReason', () => {
+  const health = (over: Record<string, unknown>) => ({
+    cacheID: 'cache-u',
+    status: 'False' as const,
+    reason: 'Watching',
+    unhealthyKindRefs: [] as { apiVersion: string; resource: string }[],
+    failure: '',
+    totalKinds: 10,
+    unhealthyKinds: 0,
+    pausedKinds: 0,
+    lastUpdateAt: null,
+    lastLiveAt: null,
+    ...over,
+  });
+  const pods = { apiVersion: 'v1', resource: 'pods' };
+  const deployments = { apiVersion: 'apps/v1', resource: 'deployments' };
+
+  it('names the kinds a stale cache is not hearing from', () => {
+    const h = health({ reason: 'Stale', unhealthyKindRefs: [pods, deployments], unhealthyKinds: 2 });
+    expect(syncReason({ label: 'Stale', tone: 'attention' }, h)).toBe('pods, deployments not receiving updates.');
+  });
+
+  it('blames the watch when a stale cache names no kind', () => {
+    const h = health({ reason: 'Stale' });
+    expect(syncReason({ label: 'Stale', tone: 'attention' }, h)).toBe('The watch may have stopped delivering updates.');
+  });
+
+  it('says a cache whose file will not open', () => {
+    const h = health({ reason: 'StoreFailed' });
+    expect(syncReason({ label: 'Storage error', tone: 'error' }, h)).toBe('The cache file will not open.');
+  });
+
+  it('summarises the failing kinds', () => {
+    const h = health({ reason: 'SyncFailed', unhealthyKindRefs: [pods], unhealthyKinds: 1 });
+    expect(syncReason({ label: 'Error', tone: 'error' }, h)).toBe('9 of 10 kinds — pods not syncing');
+  });
+
+  it('gives no reason for a healthy or muted verdict, or without a rollup', () => {
+    const failing = health({ reason: 'SyncFailed', unhealthyKindRefs: [pods], unhealthyKinds: 1 });
+    expect(syncReason({ label: 'Synced', tone: 'ok' }, health({}))).toBeNull();
+    expect(syncReason({ label: 'Stalled', tone: 'muted' }, failing)).toBeNull();
+    expect(syncReason({ label: 'Degraded', tone: 'attention' }, health({ reason: 'QuotaExceeded' }))).toBeNull();
+    expect(syncReason({ label: 'Syncing', tone: 'ok' }, null)).toBeNull();
   });
 });
