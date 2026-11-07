@@ -228,7 +228,7 @@ function BulkBar({
     // Aligned with the rows, so the select-all box sits over theirs and the
     // buttons end where their actions icons do.
     <div className="flex h-8 shrink-0 items-center justify-between pr-2 pl-1">
-      <div className="flex items-start gap-1">
+      <div className="flex items-start gap-2">
         <SelectAllCheckbox selected={selected} total={total} onToggle={onToggleAll} />
         <div className="flex flex-col text-xs/4">
           <span className="font-medium">{selected} selected</span>
