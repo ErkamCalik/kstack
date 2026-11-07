@@ -164,7 +164,7 @@ function Row({
       className={cn(
         // A row spans the list's left inset (`-ml-1`), so its fill starts at the
         // list's edge and its text sits 24px in, under the heading; on the right
-        // it stops 4px short of the scrollbar.
+        // its actions align with the bulk bar's buttons.
         'group/row -ml-1 flex items-start gap-1 rounded-xl py-3 pr-1.5 pl-1 hover:bg-secondary focus-within:bg-secondary',
         selected && 'bg-card hover:bg-card focus-within:bg-card',
         menuOpen && !selected && 'bg-secondary',
@@ -327,7 +327,7 @@ export function MemoryList({
       )}
       {/* The inset is the list's, not each row's, so an editor's focus ring is
           not clipped by the scroller. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-1">
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pl-1 pr-2">
         {adding && (
           <MemoryEditor
             taken={taken}
