@@ -87,7 +87,7 @@ function MemoryEditor({
   };
 
   return (
-    <fieldset disabled={saving} className="flex flex-col gap-1.5 px-5 pt-0.5 pb-1">
+    <fieldset disabled={saving} className="flex flex-col gap-1.5 px-5 py-1">
       <Textarea
         prose
         aria-label="Body"
