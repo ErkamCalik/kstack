@@ -91,7 +91,7 @@ export function MemoryPopoverContent() {
       <div className="flex min-h-0 flex-1 flex-col px-[18px]">
         <div
           data-testid="memory-detail"
-          className="flex min-h-0 flex-1 flex-col gap-3 rounded-xl border bg-background px-2 py-3"
+          className="flex min-h-0 flex-1 flex-col gap-3 rounded-xl border bg-background px-2 pt-[18px] pb-3"
         >
           {context ? (
             <>
