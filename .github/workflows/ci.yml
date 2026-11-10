@@ -49,7 +49,7 @@ jobs:
   # GitHub starts push and schedule runs in forks too. Outside kstackhq/kstack
   # this job runs only for a PR or a dispatch, and every other job needs it,
   # so a fork's automatic run skips whole. A job whose `if:` runs past
-  # a skipped need (`always()`) checks that Changes succeeded.
+  # a skipped need (`always()`) checks that Plan succeeded.
   fork-gate:
     name: Fork gate
     if: >-
@@ -66,7 +66,7 @@ jobs:
   # checks its own filter, so tests start beside lint and vet rather than
   # after them.
   changes:
-    name: Changes
+    name: Plan
     needs: fork-gate
     runs-on: ubuntu-24.04
     permissions:
@@ -96,13 +96,15 @@ jobs:
       # pull_request. A push or a dispatch runs every runner, and saves the
       # caches PRs and stress.yml read.
       # → docs/adr/2026-11-10-a-pull-request-runs-one-leg-per-os.md
+      # The PR legs hold one macOS version, so their os drops it: macos-27
+      # becomes macos. The full set keeps it to tell its macOS legs apart.
       - id: legs
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           runners=.github/ci-config/runners.json
           all_legs=$(jq -c . "$runners")
-          pull_request_legs=$(jq -c 'map(select(.pull_request))' "$runners")
+          pull_request_legs=$(jq -c 'map(select(.pull_request) | .os |= sub("-[0-9]+$"; ""))' "$runners")
           if [ "$EVENT_NAME" = pull_request ]; then
             legs=$pull_request_legs
           else
@@ -414,15 +416,19 @@ jobs:
   # the .deb's postinst on a stock 24.04, where user namespaces are restricted,
   # and runs the sandbox's chains through them as an ordinary user.
   sandbox-apparmor:
-    name: Sandbox · AppArmor · Ubuntu 24.04
+    name: Sandbox · Check AppArmor profiles (${{ matrix.os }}, ${{ matrix.arch }})
     needs: changes
     if: needs.changes.outputs.go == 'true'
     strategy:
       fail-fast: false
       matrix:
-        runner:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -1,10 +1,10 @@
-# dorny/paths-filter's filters, read by ci.yml's and coverage.yml's Changes
+# dorny/paths-filter's filters, read by ci.yml's and coverage.yml's Plan
 # jobs. A pull request runs a language's checks and its coverage when a path
 # here changed, so the two cannot drift: a path that ran the tests but not the
 # coverage would pass its changed lines as "0 of 0 covered".
 #
-# Go covers what Sandbox · AppArmor builds and runs. Rust builds against a stub
-# sidecar, so the sidecar is not its input.
+# Go covers what ci / Sandbox · Check AppArmor profiles builds and runs. Rust
+# builds against a stub sidecar, so the sidecar is not its input.
 shared: &shared
   - .github/actions/setup-environment/**
   - .github/ci-config/path-filters.yml
