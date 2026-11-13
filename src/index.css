@@ -212,10 +212,12 @@
     isolation: isolate;
   }
 
-  /* Desktop controls show the arrow; only links show the hand. The selectors match
-     `@kubetail/ui`'s `cursor: pointer` rule so this one, coming later, wins. */
+  /* Desktop controls and in-app links show the arrow, as a native app's sidebar does. The
+     button selectors match `@kubetail/ui`'s `cursor: pointer` rule so this one, coming
+     later, wins. A link that leaves the app opts back in with `cursor-pointer`. */
   button:not(:disabled),
-  [role='button']:not(:disabled) {
+  [role='button']:not(:disabled),
+  a[href] {
     cursor: default;
   }
 
@@ -267,6 +269,26 @@ html.frameless [data-slot='dialog-overlay'] {
 html.frameless.frame-maximized [data-slot='dialog-overlay'] {
   inset: 0;
   border-radius: 0;
+}
+
+/* A thin bar that always shows. Styling WebKit's bar makes it a classic one, drawn beside the
+   content rather than over it, so a table's row borders never show through it. Only the
+   -webkit- pseudo-elements: Chromium ignores them once scrollbar-width or scrollbar-color is set. */
+@utility table-scrollbar {
+  &::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  &::-webkit-scrollbar-track,
+  &::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  &::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background-clip: content-box;
+    background-color: color-mix(in srgb, var(--muted-foreground) 40%, transparent);
+  }
 }
 
 /* A scroll container the user still scrolls, with no bar drawn: the log viewer's header. */

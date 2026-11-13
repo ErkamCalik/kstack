@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { act, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_DASHBOARD_RESOURCE } from '@/lib/dashboard-resources';
 import type { ServerKind } from '@/lib/dashboard-resources';
@@ -29,22 +29,51 @@ vi.mock('@/routes/_app', async () => {
   const testRoot = createRootRoute();
   return {
     testRoot,
-    // Stands in for the real layout route, which owns the `resource` param.
+    // Stands in for the real layout route, which owns the `resource` and `namespace` params.
     Route: createRoute({
       getParentRoute: () => testRoot,
       id: 'app',
-      validateSearch: (search: Record<string, unknown>): { resource?: string } =>
-        typeof search.resource === 'string' && search.resource.length > 0 ? { resource: search.resource } : {},
+      validateSearch: (search: Record<string, unknown>) => ({
+        ...(typeof search.resource === 'string' && search.resource.length > 0 ? { resource: search.resource } : {}),
+        ...(typeof search.namespace === 'string' ? { namespace: search.namespace } : {}),
+      }),
       component: () => <Outlet />,
     }),
   };
 });
 
-// Both panels are covered by their own suites; this one is about which is picked.
-vi.mock('@/components/widgets/events-table', () => ({ EventsTable: () => <div data-testid="events-table" /> }));
-vi.mock('@/components/widgets/objects-table', () => ({
-  ObjectsTable: (props: Record<string, unknown>) => <div data-testid="objects-table">{JSON.stringify(props)}</div>,
+// Both panels are covered by their own suites; this one is about which is picked and
+// what each is handed.
+vi.mock('@/components/widgets/events-table', () => ({
+  EventsTable: (props: Record<string, unknown>) => <div data-testid="events-table">{JSON.stringify(props)}</div>,
 }));
+// The table's rows press their actions through `onAction`; one button per action stands in.
+vi.mock('@/components/widgets/objects-table', () => ({
+  ObjectsTable: ({ onAction, ...props }: { onAction: (action: string, o: unknown) => void }) => (
+    <>
+      <div data-testid="objects-table">{JSON.stringify(props)}</div>
+      {['yaml', 'events', 'logs'].map((action) => (
+        <button
+          key={action}
+          type="button"
+          onClick={() => onAction(action, { uid: 'u1', namespace: 'shop', name: 'web', rawJSON: {} })}
+        >
+          {action}
+        </button>
+      ))}
+    </>
+  ),
+}));
+
+const { focusObject } = vi.hoisted(() => ({ focusObject: vi.fn() }));
+vi.mock('@/lib/object-view', () => ({ useObjectView: () => ({ set: focusObject }) }));
+
+const { useClusterCachedDataObjectsMock, useClusterCachedDataEventsMock } = vi.hoisted(() => ({
+  useClusterCachedDataObjectsMock: vi.fn(),
+  useClusterCachedDataEventsMock: vi.fn(),
+}));
+vi.mock('@/lib/cluster-cached-data-objects', () => ({ useClusterCachedDataObjects: useClusterCachedDataObjectsMock }));
+vi.mock('@/lib/cluster-cached-data-events', () => ({ useClusterCachedDataEvents: useClusterCachedDataEventsMock }));
 
 // The catalog draws the page again on `catalog.emit()`, as its watch does on each frame.
 const { useClusterCachedDataKindsMock, catalog } = vi.hoisted(() => {
@@ -93,6 +122,18 @@ const KIND: ServerKind = {
   printerColumns: [],
 };
 
+const pod = (uid: string, namespace: string) => ({ uid, namespace, name: uid });
+const event = (uid: string, involvedNamespace: string) => ({ uid, involvedNamespace });
+
+beforeEach(() => {
+  focusObject.mockClear();
+  useClusterCachedDataObjectsMock.mockReturnValue({ objects: [], active: true, phase: 'live' });
+  useClusterCachedDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'live' });
+});
+
+// What the mocked component was last handed.
+const propsOf = (testId: string) => JSON.parse(screen.getByTestId(testId).textContent ?? '{}');
+
 function render(path: string, kinds: ServerKind[] = []) {
   useClusterCachedDataKindsMock.mockReturnValue({ kinds, active: true, cacheID: 'cache-1', phase: 'live' });
   return renderWithRouter(testRoot.addChildren([appRoute.addChildren([dashboardRoute])]), path);
@@ -113,6 +154,15 @@ describe('dashboard route', () => {
     expect(screen.queryByTestId('objects-table')).not.toBeInTheDocument();
   });
 
+  it.each(['yaml', 'events', 'logs'])('focuses a row’s object on its %s tab', async (action) => {
+    await render('/dashboard?resource=deployments', [KIND]);
+    fireEvent.click(screen.getByRole('button', { name: action }));
+    expect(focusObject).toHaveBeenCalledWith(
+      { apiVersion: 'apps/v1', resource: 'deployments', kind: 'Deployment', uid: 'u1', namespace: 'shop', name: 'web' },
+      action,
+    );
+  });
+
   it('shows the generic table for a discovered kind, told what it is listing', async () => {
     await render('/dashboard?resource=deployments', [KIND]);
     expect(screen.getByTestId('objects-table')).toHaveTextContent('"apiVersion":"apps/v1"');
@@ -128,20 +178,31 @@ describe('dashboard route', () => {
     expect(screen.queryByText(/coming soon/i)).not.toBeInTheDocument();
   });
 
-  it('shows a group row its placeholder at once, with no catalog to wait for', async () => {
+  it('shows Overview its placeholder at once, with no catalog to wait for', async () => {
     useClusterCachedDataKindsMock.mockReturnValue({ kinds: [], active: true, cacheID: 'cache-1', phase: 'connecting' });
     await renderWithRouter(
       testRoot.addChildren([appRoute.addChildren([dashboardRoute])]),
-      '/dashboard?resource=workloads',
+      '/dashboard?resource=overview',
     );
     expect(screen.getByText(/coming soon/i)).toBeInTheDocument();
     expect(screen.queryByText(/loading resources/i)).not.toBeInTheDocument();
   });
 
-  it('falls back to a placeholder for a group row', async () => {
+  it('reads a group id as a kind this cluster does not serve', async () => {
     await render('/dashboard?resource=workloads');
     expect(screen.queryByTestId('objects-table')).not.toBeInTheDocument();
-    expect(screen.getByText(/coming soon/i)).toBeInTheDocument();
+    expect(screen.getByText(/this cluster does not serve workloads/i)).toBeInTheDocument();
+  });
+
+  it('names a discovered kind by the kind the catalog gives it', async () => {
+    const hpa = {
+      ...KIND,
+      apiVersion: 'autoscaling/v2',
+      kind: 'HorizontalPodAutoscaler',
+      resource: 'horizontalpodautoscalers',
+    };
+    await render('/dashboard?resource=autoscaling/horizontalpodautoscalers', [hpa]);
+    expect(screen.getByRole('heading', { name: /^HorizontalPodAutoscaler\b/ })).toBeInTheDocument();
   });
 
   it('says a kind the synced catalog lacks is not served by this cluster', async () => {
@@ -163,7 +224,7 @@ describe('dashboard route', () => {
     expect(screen.queryByText(/loading resources/i)).not.toBeInTheDocument();
   });
 
-  it('keeps a group row’s placeholder while the cluster has no active cache', async () => {
+  it('keeps Overview’s placeholder while the cluster has no active cache', async () => {
     useClusterCachedDataKindsMock.mockReturnValue({
       kinds: [],
       active: false,
@@ -172,7 +233,7 @@ describe('dashboard route', () => {
     });
     await renderWithRouter(
       testRoot.addChildren([appRoute.addChildren([dashboardRoute])]),
-      '/dashboard?resource=workloads',
+      '/dashboard?resource=overview',
     );
     expect(screen.getByText(/coming soon/i)).toBeInTheDocument();
   });
@@ -233,5 +294,75 @@ describe('dashboard route', () => {
 
     await render('/dashboard?resource=');
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(expected);
+  });
+
+  it('heads a kind’s page with its label alone, and no count', async () => {
+    useClusterCachedDataObjectsMock.mockReturnValue({
+      objects: [pod('a', 'x'), pod('b', 'y')],
+      active: true,
+      phase: 'live',
+    });
+    await render('/dashboard?resource=deployments', [KIND]);
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(/^Deployments$/);
+    expect(screen.queryByTestId('page-count')).not.toBeInTheDocument();
+  });
+
+  it('shows a namespaced kind’s objects in the namespace alone', async () => {
+    useClusterCachedDataObjectsMock.mockReturnValue({
+      objects: [pod('a', 'checkout'), pod('b', 'default'), pod('c', 'checkout')],
+      active: true,
+      phase: 'live',
+    });
+    await render('/dashboard?resource=deployments&namespace=checkout', [KIND]);
+    const table = propsOf('objects-table');
+    expect(table.objects.map((o: { uid: string }) => o.uid)).toEqual(['a', 'c']);
+    expect(table.namespace).toBe('checkout');
+  });
+
+  it('shows every object of a cluster-scoped kind under a namespace, and says so', async () => {
+    const pv = { ...KIND, apiVersion: 'v1', kind: 'PersistentVolume', resource: 'persistentvolumes', scope: 'Cluster' };
+    useClusterCachedDataObjectsMock.mockReturnValue({
+      objects: [pod('a', ''), pod('b', '')],
+      active: true,
+      phase: 'live',
+    });
+    await render('/dashboard?resource=persistentvolumes&namespace=checkout', [pv]);
+    expect(propsOf('objects-table').objects).toHaveLength(2);
+    expect(propsOf('objects-table').namespace).toBeUndefined();
+    expect(screen.getByText(/Cluster-scoped, so the/)).toHaveTextContent(
+      "Cluster-scoped, so the checkout filter isn't applied.",
+    );
+  });
+
+  it('heads Events with its count, scoped to the namespace', async () => {
+    useClusterCachedDataEventsMock.mockReturnValue({
+      events: [event('a', 'checkout'), event('b', 'default')],
+      active: true,
+      phase: 'live',
+    });
+    await render('/dashboard?resource=events&namespace=checkout');
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Events');
+    expect(screen.getByTestId('page-count')).toHaveTextContent('1');
+    expect(screen.getByText(/Events in/)).toHaveTextContent('Events in checkout.');
+    const table = propsOf('events-table');
+    expect(table.events.map((e: { uid: string }) => e.uid)).toEqual(['a']);
+    expect(table.namespace).toBe('checkout');
+  });
+
+  it('heads Events with every event and no subtitle without a namespace', async () => {
+    useClusterCachedDataEventsMock.mockReturnValue({
+      events: [event('a', 'x'), event('b', 'y')],
+      active: true,
+      phase: 'live',
+    });
+    await render('/dashboard?resource=events');
+    expect(screen.getByTestId('page-count')).toHaveTextContent('2');
+    expect(screen.queryByText(/Events in/)).not.toBeInTheDocument();
+  });
+
+  it('draws no Events count before the events land', async () => {
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'connecting' });
+    await render('/dashboard?resource=events');
+    expect(screen.queryByTestId('page-count')).not.toBeInTheDocument();
   });
 });

@@ -107,9 +107,19 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 - **Paged object watches.** Nothing pages anywhere: `clusterCachedDataObjectsWatch` snapshots a kind's whole set and ships every `rawJSON` body over the IPC bridge. On a large kind that is the dominant cost of the dashboard — bigger than anything [the read split](adr/2026-08-29-object-read-split.md) addresses, which only shrinks the sidecar's half.
   - **The snapshot read bounds easily; the cursor reads do not.** Bound `ObjectsWithCursor` by a keyset range — `AND (namespace, name) > (?, ?) ORDER BY namespace, name LIMIT ?` — and the snapshot is a window. The changes read past the cursor name objects, not positions, so a window's watch has to re-derive the range when one lands in or next to it: an insert above the window, a rename that moves a row out of it, a delete that pulls the next row in are then just "what is in the range now vs. what was", never a shift to reason about. Two things are already in place: `objects_kind_ns_name(api_version, kind, namespace, name)` is exactly the keyset index for that order, and `kind_counts` gives the total for a scrollbar in O(1) with no scan.
-  - **Settle the sort/filter contract first — it is the whole decision.** Paging trades *sort and filter by anything, client-side* for *sort and filter by what the store indexes*. `objects` carries `namespace`, `name`, `created_at`, `status_summary`, `ready_count`/`total_count`, `restart_count` and `host` as real columns, and `labels` is joinable for selector filters, so the common orders are servable. What is not: the kind-specific columns `src/components/widgets/object-columns.tsx` derives from `rawJSON` client-side — sorting a paged Pods table by Restarts asks for an order the store cannot produce. Either accept that those columns do not sort, promote more of them into columns at write time (`projectObject` already extracts several), or do not page. A product call, not a storage one.
+  - **Settle the sort/filter contract first — it is the whole decision.** Paging trades *sort and filter by anything, client-side* for *sort and filter by what the store indexes*. `objects` carries `namespace`, `name`, `created_at`, `status_summary`, `ready_count`/`total_count`, `restart_count` and `host` as real columns, and `labels` is joinable for selector filters, so the common orders are servable. What is not: the kind-specific columns `src/components/widgets/object-columns/` derives from `rawJSON` client-side — sorting a paged Pods table by Restarts asks for an order the store cannot produce. Either accept that those columns do not sort, promote more of them into columns at write time (`projectObject` already extracts several), or do not page. A product call, not a storage one.
   - **The protocol wrinkle:** subscription variables are fixed for the life of a subscription, so moving the window means resubscribing — a debounced resubscribe per scroll settle, re-snapshotting a window's worth of rows. Cheap, but it makes the window a subscription variable (or a search param) rather than client state, and every move is a round trip.
   - **Not what the change log is for.** A log tail names the uid that changed, which is not a position in a sort order: inserting one object above the window shifts a row out of the bottom, and the entry mentions neither of the two objects whose page membership moved. Kubernetes offers `limit`/`continue` on list and nothing on watch for the same reason.
+
+- **Namespaced watches.** Every objects and events watch streams a kind's whole set, so a
+  dashboard page under a namespace scope filters client-side (a data gap of the new dashboard,
+  [#881](https://github.com/kstackhq/kstack/issues/881)). The objects and events watches could
+  take a `namespace` argument, as `clusterCachedDataKindsWatch` does.
+
+- **A health verdict per object and per kind.** The dashboard has no shared definition of a problem, so the sidebar draws no problem badges and no *Show only kinds with problems*, and the kind pages' status tabs and the Overview's *Needs attention* have nothing to count (a data gap of the new dashboard, [#881](https://github.com/kstackhq/kstack/issues/881)). The client cannot fill the gap: the kinds watch carries counts alone, and judging objects in the webview would mean streaming every kind's objects to badge the sidebar.
+  - **Decide the definition first — it is a product call.** Per kind, which state is a problem: a Pod failed or unknown, a container waiting on CrashLoopBackOff or ImagePullBackOff, or not ready; a Deployment, StatefulSet or DaemonSet below its desired ready replicas; a failed Job; a Node not Ready or under pressure; a PVC Pending or Lost. Whether restarts count, and which kinds have no verdict at all. Record it in an ADR.
+  - **Shape:** the sidecar judges each object as it writes it, next to what `projectObject` already extracts (`status_summary`, `ready_count`/`total_count`, `restart_count`), and serves a verdict on `ClusterCachedDataObject` and a problem count on `ClusterCachedDataKind`, streamed like `count`.
+  - **Then the webview:** a `ProblemBadge` on `NavItem` and `NavGroup` (a closed group sums its kinds), *Show only kinds with problems*, and Overview's badge, whose meaning the Overview page settles.
 
 - **One measurement per cache for the stats gauge, not one per subscriber.** `cachesAPI.WatchStats` builds its whole loop inside `NewStream`'s pump (`services/cluster/caches.go:347`, `stream.go:180`), so every subscriber gets its own: three windows on one cache means three 5-second tickers, three file measurements, and three sets of row-count queries against the same file. The counts are the expensive half — the file measurement is three `os.Stat` calls, the counts are SQL. Nothing is wrong with the answers; the work is just done N times. **Shape:** one measurement stream per cache, multicast to its subscribers, the way the delta watches already fan out — the pump moves off the subscription and onto the cache, and a subscriber joins the running one and gets the current value on arrival (the gauge is current-on-subscribe, so a joiner must not wait for the next tick). `WatchHealth` has the same per-subscriber shape over the records, so whatever carries the multicast should be able to serve both. **Not blocked on anything**, and independent of the cache size ceiling: the janitor's own measurement is a different caller with a different lifetime, and is not what this de-dupes.
 
@@ -645,6 +655,61 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 ## Frontend (webview)
 
+- **The dashboard tables' scrollbar ignores macOS's setting.** The tables draw a custom bar
+  that always shows (`table-scrollbar`, `index.css`), since WebKit draws the rows' separators
+  over its overlay bar. Moving the separators onto the cells (`border-separate`) did not stop
+  it. The log viewer, with no row separators, keeps the system's bar. Find what draws over it,
+  and let the tables take the system's bar again.
+
+- **A pod's node facts in the Pods table.** OS, Arch, Region, Zone and instance type are the
+  node's, not the pod's: its `kubernetes.io/os`, `kubernetes.io/arch`,
+  `topology.kubernetes.io/region`, `topology.kubernetes.io/zone` and
+  `node.kubernetes.io/instance-type` labels. The Pods page would watch `v1/nodes` beside its pods
+  and look each pod's `spec.nodeName` up, offering those as hidden-by-default columns in the
+  column picker (`object-columns/pods.tsx`). The same lookup draws a pod's node name in red while that
+  node is not Ready, as the mockup's Pods frame does. The cache already holds the nodes.
+
+- **The object panel watches whole streams for one object.** Its YAML tab holds an `unshared`
+  `clusterCachedDataObjectsWatch` of the object's kind, and its Events tab an `unshared`
+  `clusterCachedDataEventsWatch` of the whole cache, each beside the page's own. **Shape:** watches
+  scoped to one object (by `uid`, or namespace and name), which the pod detail page (dashboard
+  spec, step 4) wants too.
+- **An object's Events tab also shows an earlier object's events.** The events watch names an
+  event's object by kind, namespace and name, so a pod deleted and recreated under the same name
+  shows both pods' events (`object-events-view.tsx`). **Fix:** add `involvedUID` to the
+  sidecar's cached event and match on it.
+- **No way from an object's events to the Events page.** The object panel's Events tab lists the
+  object's events alone; the Events page has no filter to open it on. **Shape:** a filter on the
+  Events page (by object, and text like the kind tables'), and *Open in Events* at the foot of the
+  tab.
+- **A dashboard log view cannot move to a window.** The object panel's Logs tab
+  (`object-logs-view.tsx`) has no *Open in window*: a log window is keyed by a chat and its call
+  (`LogWindowsProvider`, the host's `log_windows.rs`), and this view has neither. **Shape:** a
+  window keyed by its view, so any view can open one. The pod detail page's Logs tab (dashboard
+  spec, step 4) will want the same.
+- **An object's Logs tab reads every container.** A pod with a sidecar (`istio-proxy`) mixes its
+  lines in. **Shape:** a container picker in the tab, from the pod's spec, feeding the source's
+  `containers`.
+- **A table cell cannot be copied.** The kind tables draw names, IPs, images and labels the user
+  wants on the clipboard, and a row selects no text usefully. **Shape:** a copy affordance on a
+  cell's hover, writing the full value (not the truncated one) through `copyToClipboard`
+  (`src/lib/clipboard.ts`); which columns offer it is a design call.
+- **No cluster writes from the dashboard.** Restart (rollout), scale, delete, cordon, uncordon and
+  drain a node, suspend or trigger a CronJob, roll back: the mockups draw several, and the sidecar
+  has no mutation that writes a Kubernetes object. Each is a new mutation and a security change,
+  since today a cluster write reaches the cluster only through an approved command
+  (`docs/security-model.md`). **Shape first:** whether a write from a click asks as the model's
+  does, and how a destructive one confirms.
+- **No debug terminal for a pod.** The mockups' `Pod detail / Debug terminal`: an exec (or
+  ephemeral debug container) session from the pod's row or detail page. It needs an exec stream
+  in the sidecar and the exec window the security model anticipates (`src/CLAUDE.md`, *Security
+  invariants*: no HTML interpretation, control sequences stripped).
+- **A Secret's values cannot be revealed.** The sidecar redacts Secret data when it writes the
+  cache, so the table and YAML hold `[redacted]` and the webview has nothing to show. A reveal is
+  a live read of the one Secret, and Secret data is a permissioned read
+  (`docs/security/2026-10-05-secret-data-is-a-permissioned-read.md`): a click reading it is a
+  security change, recorded under `docs/security/`.
+
 - **The log viewer shows only the filters the model set.** Kubetail's sidebar lists each region, zone, OS, architecture and node the open sources span, with a count per value. That needs one query answering what a view's sources resolved to, which the sidecar's resolve already computes (`services/logs/resolve.go`) and the wire does not carry.
 - **A workload's log view has no switch to hide its gone pods or its earlier instances.** A
   Deployment's view shows every pod the Deployment runs or ran within the log file's retention, a
@@ -685,12 +750,68 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 - **Swap the code-block highlighter to Shiki.** `src/lib/highlight.ts` runs highlight.js through `lowlight`: regex grammars that visibly misfire on nested YAML, template strings and JSX, and a hand palette in `markdown.css` rather than an editor's theme. Shiki is VS Code's own TextMate grammars and themes, so a manifest highlights the way it does in the editor. The render path stays as it is — `codeToHast` yields the same hast `hast-util-to-jsx-runtime` already renders, so no HTML string enters, and the change is contained to `highlight.ts` plus the `Code` component in `markdown.tsx`. **Weigh:** the engine is Oniguruma compiled to WASM (~600 KB) or the pure-JS `@shikijs/engine-javascript` (lighter, weaker grammar compatibility), and grammars run 2–5× highlight.js's — a heavier baseline than today's 22 KB even lazily loaded; tokenizing is async-only, so a growing block re-highlights through a promise rather than the synchronous `highlight` call; and dual-scheme colours become `themes: { light, dark }` emitting both as CSS variables per token, which replaces the `--hl-*` palette rather than reusing it. **Trigger:** the first highlighting misfire someone notices on a manifest, or an editor-matching theme being wanted.
 
-- **Built-in kinds with no columns.** The per-kind registry (`src/components/widgets/object-columns.tsx`)
-  carries hand-written accessors for **Pod and Deployment only**; every other built-in falls back to
-  the universal Namespace/Name/Age. CRDs are handled — they carry their own `printerColumns` — so
-  what remains is the obvious built-ins: StatefulSet, ReplicaSet, Node, Service, Job, CronJob, PVC.
-  Note **DaemonSet cannot reuse the Deployment/workload accessors** — it has no `spec.replicas`; its
-  Ready is `status.numberReady`/`status.desiredNumberScheduled`.
+- **The new dashboard is unfinished** ([#881](https://github.com/kstackhq/kstack/issues/881), from
+  the *K8s Dashboard (imported)* page of the
+  [Kstack Figma file](https://www.figma.com/design/TeS8ZaScKc01RDfYJ06A8N/Kstack)). The sidebar,
+  the namespace scope, the page header and the kind tables are built. Still to build:
+  - **A pod detail page** (`Pod detail / Overview`, `Pod detail / Logs`): a route for one object,
+    with a header (status, owner, node, IP, age, restarts) and Overview, Logs, Events and YAML
+    tabs. The route never builds or parses an `ObjectID`.
+  - **The Overview page** (`Overview (all namespaces)`): today it reads "coming soon". Build the
+    tiles existing data fills: *Needs attention*, *Nodes ready*, *Pods running*, and *Namespaces*
+    with workload counts.
+  - **The data gaps** not filed above (*Namespaced watches* and *A health verdict* are, under
+    *Sidecar — cluster service*): object search across kinds, for the sidebar's search; usage
+    metrics, for CPU and Memory columns; resource requests across the cluster; cluster facts
+    (Kubernetes version, provider, region, upgrades); external sources (Prometheus alerts, Argo CD
+    syncs). A view that meets a gap draws without it, never with placeholder numbers.
+
+- **No keyboard jump to a dashboard page.** The mockups' kind switcher (`Kind switcher menu
+  (open)`) jumped to any kind from the keyboard; the dashboard leaves it out, since its rows are
+  the sidebar's. A window-wide jump (⌘K) over the sidebar's pages and kinds would bring the
+  keyboard path back. `ScopeMenu` (`dashboard-resource-nav/scope-menu.tsx`) already has the list,
+  search and keys.
+
+- **The dashboard's namespace scope holds one namespace.** The sidebar's namespace picker picks one
+  namespace or all of them ([ADR](adr/2026-11-12-the-namespace-scope-is-a-search-param.md)). Let it pick
+  several: the `namespace` param becomes a list, the picker's menu gains checkboxes, the tables
+  filter by the set, and the sidebar's *Namespace* heading names the count when there are more
+  than one.
+
+- **One localStorage hook for JSON chrome.** `useTableColumns` (`src/lib/table-columns.ts`) and
+  `useLogViewerColumns` (`components/widgets/log-viewer/columns.ts`) each carry the same
+  read-with-fallback and save-in-try/catch code; `usePersistedFlag` and `usePersistedWidth` are two
+  more copies. They already differ: `usePersistedFlag` re-reads when its key changes,
+  `useTableColumns` reads once per mount, so it shows the right kind's columns only because
+  `dashboard.tsx` keys `ObjectsTable` on the kind. **Fix:** a `usePersistedJson(key, parse,
+  fallback)` beside `persisted-flag.ts` that re-reads on a key change, under both column hooks.
+
+- **Two column pickers.** The log viewer's toolbar (`log-viewer/toolbar.tsx`) has its own Columns
+  popover of checkbox rows; `ColumnPicker` (`components/widgets/column-picker.tsx`) does the same
+  and adds reordering and *Reset*. Their triggers already differ (a ghost icon button against an
+  outlined one). **Fix:** the log viewer takes `ColumnPicker`, with reordering optional or on, or
+  the two share one checkbox row. Whether the log viewer gains reordering is a product call.
+
+- **A pod's tone has names of its own.** `status-pill.tsx`'s `StatusTone` (`ok`, `pending`,
+  `failing`) maps one-to-one onto cluster health's `Tone` (`ok`, `attention`, `error`) through
+  `HEALTH_TONE`, so callers translate (`TONE[HEALTH_TONE[b]].text` in `objects-table.tsx`), and the
+  pill draws its own dot beside `ClusterDot` at another size. **Fix:** type pod tones as `Tone`,
+  drop `StatusTone` and `HEALTH_TONE`, and draw the dot with `ClusterDot`.
+
+- **One gate for a watch's not-synced and loading states.** `ObjectsTable`, `EventsTable`, and
+  `PlaceholderPage` in `routes/dashboard.tsx` each draw "not synced" without an
+  active cache, a spinner until the `Bookmark`, then their content, and their wording has drifted
+  (*Loading…* against *Loading pods…*). **Fix:** one component (`<WatchGate active phase noun>`)
+  that draws the note or the spinner, else its children, so the never-empty-before-the-`Bookmark`
+  rule lives in one place.
+
+- **A table's density is split between two files.** `VirtualTable`'s `TALL_ROW` sets its cells'
+  vertical padding, since the row's height depends on it, while `ObjectsTable` sets their
+  horizontal padding and the header's height with descendant selectors on its card (`HEADER`,
+  `CELLS`). `EventsTable` keeps the library's spacing, and a third table would copy the selectors.
+  **Fix:** `VirtualTable` takes the density, on `RowSize` beside `className` and `px`, and sets all
+  of the cell padding and the header height itself. Whether `EventsTable` takes the tight one is a
+  design call.
 
 - **Evaluate moving provenance down into `useWatchSubscription` (keyed on urql's operation key).** `useCacheDeltaWatch`'s provenance is a caller-derived string compared against server-echoed fields (`cacheID` + `apiVersion`/`resource` on `ClusterCachedDataObjectWatchFrame`). But one layer down, `useWatchSubscription` already computes `createRequest(query, variables).key` — which changes *exactly* when the watch's variables change, i.e. it is precisely `(cacheID)` for kinds/events and `(cacheID, apiVersion, resource)` for objects, derived automatically for any subscription. And that file already implements this same tag-fold-mask pattern for the sibling dimension (`generation`, for reconnects). **Fix:** make `Generational<Result>` carry `{ generation, key, result }` and gate both the reducer's fold and the exposed-`data` mask on `key` as well — then `currentProvenance`, `DeltaFrame.provenance`, `joinProvenance`, *and* the `apiVersion`/`resource` schema echo fields all disappear, and every future keyed watch gets staleness protection for free instead of re-spelling it. **Weigh first:** server-echoed provenance additionally defends against a genuinely *mis-routed* frame (a sidecar/host-bridge multiplexing bug), which a client-side key cannot — nothing currently claims that as a motivation, so if it *is* wanted, say so where the fields are defined, since it's the only thing justifying the schema surface. Also note the current design's failure mode is silent: a mismatch between the two hand-spelled provenance strings drops every frame with no type-level protection.
 

@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The dashboard's cached Kubernetes Events table (newest first), fed by
-// `useClusterCachedDataEvents`. Unfiltered for now. Gates on `active`/`phase` — the
-// pattern every whole-screen watch view follows.
+// The dashboard's cached Kubernetes Events table (newest first), over the rows its page
+// reads from `useClusterCachedDataEvents`. Gates on `active`/`phase` — the pattern every
+// whole-screen watch view follows.
 // See docs/adr/2026-08-09-delta-watch-protocol.md
 import { Spinner } from '@kubetail/ui/elements/spinner';
 import ReactTimeAgo from 'react-timeago';
 
 import { VirtualTable } from '@/components/widgets/virtual-table';
 import type { VirtualColumn } from '@/components/widgets/virtual-table';
-import { useClusterCachedDataEvents } from '@/lib/cluster-cached-data-events';
+import { VisibleText } from '@/components/widgets/visible-text';
 import type { ClusterCachedDataEvent } from '@/lib/cluster-cached-data-events';
+import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 
 // kubectl-style "Kind namespace/name"; any part may be absent (cluster-scoped or
 // name-only reference).
@@ -33,7 +34,7 @@ function involvedRef(e: ClusterCachedDataEvent): string {
 
 // `type` is an open Kubernetes string — a cluster may omit it or supply a custom
 // value, so everything but Warning stays muted (empty renders "Unknown").
-function TypeBadge({ type }: { type: ClusterCachedDataEvent['type'] }) {
+export function TypeBadge({ type }: { type: ClusterCachedDataEvent['type'] }) {
   const warning = type === 'Warning';
   return (
     <span
@@ -51,17 +52,18 @@ const rowKey = (e: ClusterCachedDataEvent) => e.uid;
 // Object and Message truncate under the fixed layout, with the full text on hover; Message
 // takes the width the sized columns leave.
 const COLUMNS: VirtualColumn<ClusterCachedDataEvent>[] = [
-  { key: 'type', header: 'Type', className: 'w-24', cell: (e) => <TypeBadge type={e.type} /> },
+  { key: 'type', header: 'Type', width: 96, cell: (e) => <TypeBadge type={e.type} /> },
   {
     key: 'reason',
     header: 'Reason',
-    className: 'w-48',
+    width: 192,
     cell: (e) => <span className="font-medium">{e.reason || '—'}</span>,
   },
   {
     key: 'object',
     header: 'Object',
-    className: 'w-64 truncate',
+    className: 'truncate',
+    width: 256,
     cell: (e) => {
       const ref = involvedRef(e);
       return <span title={ref}>{ref || '—'}</span>;
@@ -71,17 +73,19 @@ const COLUMNS: VirtualColumn<ClusterCachedDataEvent>[] = [
     key: 'message',
     header: 'Message',
     className: 'truncate',
+    minWidth: 240,
     cell: (e) => (
       <span className="text-muted-foreground" title={e.message}>
         {e.message || '—'}
       </span>
     ),
   },
-  { key: 'count', header: 'Count', className: 'w-16 text-right tabular-nums', cell: (e) => e.count },
+  { key: 'count', header: 'Count', className: 'text-right tabular-nums', width: 64, cell: (e) => e.count },
   {
     key: 'lastSeen',
     header: 'Last Seen',
-    className: 'w-32 tabular-nums',
+    className: 'tabular-nums',
+    width: 128,
     cell: (e) => {
       // lastSeen is null when the source Event carried no timestamp.
       const lastSeenMs = e.lastSeen ? Date.parse(e.lastSeen) : Number.NaN;
@@ -90,9 +94,16 @@ const COLUMNS: VirtualColumn<ClusterCachedDataEvent>[] = [
   },
 ];
 
-export function EventsTable() {
-  const { events, active, phase } = useClusterCachedDataEvents();
+type EventsTableProps = {
+  // The watch's rows, already filtered to `namespace`.
+  events: ClusterCachedDataEvent[];
+  active: boolean;
+  phase: WatchPhase;
+  // The namespace the rows are filtered to, if any.
+  namespace?: string;
+};
 
+export function EventsTable({ events, active, phase, namespace }: EventsTableProps) {
   // No active cache: an unsynced/paused cluster streams nothing — say so rather
   // than spin forever.
   if (!active) {
@@ -114,7 +125,18 @@ export function EventsTable() {
   }
 
   if (events.length === 0) {
-    return <p className="text-sm text-muted-foreground">No events.</p>;
+    return (
+      <p className="text-sm text-muted-foreground">
+        No events
+        {namespace !== undefined && (
+          <>
+            {' in '}
+            <VisibleText text={namespace} />
+          </>
+        )}
+        .
+      </p>
+    );
   }
 
   return <VirtualTable rows={events} rowKey={rowKey} columns={COLUMNS} />;
