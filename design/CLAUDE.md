@@ -9,8 +9,8 @@ How the webview's design in Figma maps to the code in `src/`, and how agents syn
 
 Every group on a page is a Figma section, laid out so that no two overlap. A new component or screen goes in its group's section, and the section grows to fit it.
 
-- **Components** has one section per folder of `src/components/`, left to right: Icons, Primitives, Shell, Dashboard, Cluster, Chat, Logs. Each section names its folder under its title and stacks its components top to bottom. A popup gets a nested section of its own (`ClusterStatus`, `ClusterPicker`, `MemoryPopover` in Cluster; `ModelPicker` in Chat).
-- **Screens** has one section per screen, top to bottom: Platforms, Popups on Shell, Dashboard / Pods, Chat / New, Chat / Open, Chat / Model picker open, Chat / Sandbox open, Log window. A screen's section holds its *Kstack Light* frame, then its *Kstack Dark* frame, and above them its [stamp](#manifest), a text layer named `Stamp`.
+- **Components** has one section per folder of `src/components/`, left to right: Icons, Primitives, Shell, Dashboard, Cluster, Chat, Logs. Each section names its folder under its title and stacks its components top to bottom. A popup gets a nested section of its own (`ClusterStatus`, `ClusterPicker`, `MemoryPopover` in Cluster; `ModelPicker`, `SandboxPopover`, `ContextPopover` in Chat).
+- **Screens** has one section per screen, top to bottom: Platforms, Popups on Shell, Dashboard / Pods, Chat / New, Chat / Open, Chat / Model picker open, Chat / Sandbox open, Chat / Context open, Log window. A screen's section holds its *Kstack Light* frame, then its *Kstack Dark* frame, and above them its [stamp](#manifest), a text layer named `Stamp`.
 - The layers panel lists sections in the order the canvas shows them.
 
 ## Tokens
@@ -202,6 +202,7 @@ Never `record -stamps` an edited component to clear the report without that answ
 | Chat / Open | Light and dark: a transcript with tool calls, a log card and a waiting approval; the composer answering |
 | Chat / Model picker open | Light and dark: `ModelPicker/Menu` open below the trigger on a new chat, and above it on an open one |
 | Chat / Sandbox open | Light and dark: `SandboxPopover` open on a new chat and on an open one |
+| Chat / Context open | Light and dark: `ContextPopover` open below the add-context button on a new chat |
 | Log window | Light and dark: a tail with a grep, a gap notice and the landed row |
 
 `ClusterStatus`, `ClusterPicker` and `MemoryPopover` draw every state on the Components page; `ModelPicker/Menu` draws Anthropic's. Not drawn yet: the other popovers (scope menu and column picker), the memory row's actions menu and its delete confirm; hover and focus states; the dialog and drawer scrims; the Events page, the object panel and the settings dialog; loading, empty, deleted and error states; Markdown beyond paragraphs and inline code; and the log viewer's selection.

@@ -37,6 +37,7 @@ import { useLogsView } from '@/lib/logs-view';
 import { modelOf, seedPick, useModels } from '@/lib/models';
 import { useRightSidebar } from '@/lib/right-sidebar';
 
+import { ContextPopover } from './context-popover';
 import { ChatGrants } from './grants';
 import { ModelPicker } from './model-picker';
 import { NetworkSwitch } from './network-switch';
@@ -341,6 +342,11 @@ export function ChatComposer({
         <div
           className={`flex rounded-[10px] border bg-background shadow-sm focus-within:border-ring dark:bg-card ${openChat ? 'items-end' : 'flex-col'}`}
         >
+          {openChat && (
+            <div className="shrink-0 p-1.5">
+              <ContextPopover />
+            </div>
+          )}
           <textarea
             {...PROSE_TEXT}
             value={draft}
@@ -357,7 +363,10 @@ export function ChatComposer({
               onSend();
             }}
           />
-          <div className={`flex shrink-0 justify-end gap-2 ${openChat ? 'p-1.5' : 'px-2.5 pb-2.5'}`}>{action}</div>
+          <div className={`flex shrink-0 gap-2 ${openChat ? 'justify-end p-1.5' : 'justify-between px-2.5 pb-2.5'}`}>
+            {!openChat && <ContextPopover />}
+            {action}
+          </div>
         </div>
         {/* The chat's settings. Wraps rather than clip at the dashboard sidebar's narrowest. */}
         <div className="flex flex-wrap items-center justify-between gap-1 px-1">
