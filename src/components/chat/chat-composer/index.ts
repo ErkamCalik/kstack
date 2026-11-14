@@ -12,6 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The chat's message box. The model picker, the sandbox and network switches and
+// The chat's message box. The model picker, the add-context button, the sandbox and network switches and
 // the chat's grants are its own.
 export { ChatComposer } from './composer';

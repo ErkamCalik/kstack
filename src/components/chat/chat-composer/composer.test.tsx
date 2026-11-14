@@ -232,6 +232,13 @@ beforeEach(() => {
 describe('ChatComposer', () => {
   const sandboxButton = () => screen.queryByRole('button', { name: /sandbox/i });
 
+  it('draws the add-context button on a new chat and an open one', () => {
+    const view = renderComposer({ chatID: null });
+    expect(screen.getByRole('button', { name: 'Add context' })).toBeInTheDocument();
+    view.rerender({ chatID: 'c1' });
+    expect(screen.getByRole('button', { name: 'Add context' })).toBeInTheDocument();
+  });
+
   it('draws the sandbox button where there is a sandbox', () => {
     const view = renderComposer({ sandboxAvailable: true, sandboxDisabled: true });
     expect(sandboxButton()).toHaveTextContent('Outside the sandbox');

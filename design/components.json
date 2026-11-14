@@ -553,12 +553,16 @@
       "figma": {
         "node": "20:224",
         "name": "ChatComposer",
-        "hash": "b348fc91d4806c9f"
+        "hash": "6410fd27ce4a4079"
       },
       "code": [
         {
           "path": "src/components/chat/chat-composer/composer.tsx",
-          "blob": "8b29cbbc2b465179749e9d5855769058cf179d99"
+          "blob": "10627a7b1f6adb08f1ededa14898e55718e5b944"
+        },
+        {
+          "path": "src/components/chat/chat-composer/context-popover.tsx",
+          "blob": "13d88b114dc39d42e8af262b55a4331942503d5b"
         }
       ]
     },
@@ -681,6 +685,23 @@
         "Two settings: a label and hint beside a Select (sm) or a Switch.",
         "The footer (border-t bg-muted/50 px-3 py-2, as ModelPicker/Menu) sums up what the next request carries, beside Inspect payload, an outline Button xs.",
         "Hangs 8px from the trigger, its left edge on the trigger's: below it on a new chat, above it on an open one."
+      ]
+    },
+    {
+      "id": "chat/context-popover",
+      "figma": {
+        "node": "2087:2455",
+        "name": "ContextPopover",
+        "hash": "f7375aad9f77cc36"
+      },
+      "code": [
+        {
+          "path": "src/components/chat/chat-composer/context-popover.tsx",
+          "blob": "13d88b114dc39d42e8af262b55a4331942503d5b"
+        }
+      ],
+      "notes": [
+        "A placeholder popup: the code's `bg-popover` `w-72` panel with a title and one muted line."
       ]
     },
     {
@@ -1149,6 +1170,19 @@
       }
     },
     {
+      "id": "icon/plus",
+      "figma": {
+        "node": "2082:2400",
+        "name": "Icon/plus",
+        "hash": "00ab921324299855"
+      },
+      "package": {
+        "name": "lucide-react",
+        "export": "PlusIcon",
+        "version": "1.68.0"
+      }
+    },
+    {
       "id": "icon/power",
       "figma": {
         "node": "5:148",
@@ -1562,6 +1596,20 @@
         {
           "path": "src/components/chat/chat-composer/sandbox-popover.tsx",
           "blob": "4647d9e88a1af873d691b72c744800555d8a5dca"
+        }
+      ]
+    },
+    {
+      "id": "screens/chat-context-open",
+      "figma": {
+        "node": "2087:8438",
+        "name": "Chat / Context open",
+        "hash": "7ef6481e3407bbe3"
+      },
+      "code": [
+        {
+          "path": "src/components/chat/chat-composer/context-popover.tsx",
+          "blob": "13d88b114dc39d42e8af262b55a4331942503d5b"
         }
       ]
     },
