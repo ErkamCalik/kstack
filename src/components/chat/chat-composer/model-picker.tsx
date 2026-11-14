@@ -12,102 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The model and effort selects over the whole catalog, side by side as one control.
+// The composer's model and effort: one button naming both, opening one menu with a tab
+// per provider, the tab's models and the picked model's effort levels.
+import { Radio } from '@base-ui/react/radio';
+import { RadioGroup } from '@base-ui/react/radio-group';
 import { Button } from '@kubetail/ui/elements/button';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuTrigger,
-} from '@kubetail/ui/elements/dropdown-menu';
-import { ChevronDown } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { Popover, PopoverContent, PopoverTrigger } from '@kubetail/ui/elements/popover';
+import { Check } from 'lucide-react';
+import { useState } from 'react';
 
+import { SectionHeading } from '@/components/primitives/section-heading';
 import type { Model, ModelPick } from '@/lib/models';
 
-type Option = { value: string; label: string };
-type OptionGroup = { label?: string; options: Option[] };
+// The segmented control ModeNav draws, for the provider tabs and the effort levels.
+const TRACK = 'flex w-full items-center rounded-lg bg-muted p-[3px] text-muted-foreground';
+const SEGMENT =
+  'flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-[13px] font-medium transition-colors hover:text-foreground ' +
+  'aria-checked:bg-background aria-checked:text-foreground aria-checked:shadow-sm ' +
+  'aria-pressed:bg-background aria-pressed:text-foreground aria-pressed:shadow-sm';
 
-// One of the picker's two selects: what is picked now, with the choices under it,
-// in groups. A heading is drawn only when there is more than one group: one
-// provider needs none. The two sit side by side as one control, so only the last
-// one carries the chevron.
-function Segment({
-  label,
-  value,
-  groups,
-  onSelect,
-  leading,
-  chevron = false,
-}: {
-  label: string;
-  value: string;
-  groups: OptionGroup[];
-  onSelect: (next: string) => void;
-  /** Drawn before the picked label. */
-  leading?: ReactNode;
-  chevron?: boolean;
-}) {
-  const current = groups.flatMap((g) => g.options).find((o) => o.value === value);
-  const headed = groups.length > 1;
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button
-            variant="ghost"
-            size="sm"
-            className="min-w-0 shrink gap-1.5 px-1.5 text-sm font-normal text-muted-foreground"
-          />
-        }
-        aria-label={`${label}: ${current?.label ?? value}`}
-      >
-        {leading}
-        <span className="truncate">{current?.label ?? value}</span>
-        {chevron && <ChevronDown className="size-3.5 shrink-0" aria-hidden />}
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" sideOffset={6} className="max-h-80 min-w-40 overflow-y-auto">
-        {/* Called with the value alone: base-ui also passes event details, which the
-            setter would take as a stray second argument. */}
-        <DropdownMenuRadioGroup value={value} onValueChange={(next: string) => onSelect(next)}>
-          {groups.map((g, i) => (
-            <DropdownMenuGroup key={g.label ?? i}>
-              {headed && <DropdownMenuLabel>{g.label}</DropdownMenuLabel>}
-              {g.options.map((o) => (
-                <DropdownMenuRadioItem key={o.value} value={o.value}>
-                  {o.label}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuGroup>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-// A model's key in the select: the id alone is not one, two providers being free to
-// name a model the same.
-const keyOf = (providerID: string, id: string) => `${providerID}/${id}`;
-
-// The catalog as one group per provider, in catalog order, headed by its label.
-function groupByProvider(models: Model[]): OptionGroup[] {
-  const byProvider = new Map<string, OptionGroup>();
-  models.forEach((m) => {
-    const group = byProvider.get(m.provider.id) ?? { label: m.provider.label, options: [] };
-    byProvider.set(m.provider.id, group);
-    group.options.push({ value: keyOf(m.provider.id, m.id), label: m.label });
-  });
-  return [...byProvider.values()];
-}
-
-// The provider's mark beside the model: its initial, on its brand colour where
-// there is one.
+// The provider's mark: its initial, on its brand colour where there is one.
 const PROVIDER_MARKS: Record<string, string> = {
   anthropic: 'bg-[#d97757] text-neutral-900',
+  openai: 'bg-foreground text-background',
 };
 
 function ProviderMark({ id, label }: { id: string; label: string }) {
@@ -121,6 +48,19 @@ function ProviderMark({ id, label }: { id: string; label: string }) {
   );
 }
 
+// A model's value in the radio group: the id alone is not one, two providers being
+// free to name a model the same.
+const keyOf = (providerID: string, id: string) => `${providerID}/${id}`;
+
+// The catalog's providers, in the order their first model comes.
+function providersOf(models: Model[]): Model['provider'][] {
+  const seen = new Map<string, Model['provider']>();
+  models.forEach((m) => {
+    if (!seen.has(m.provider.id)) seen.set(m.provider.id, m.provider);
+  });
+  return [...seen.values()];
+}
+
 type ModelPickerProps = {
   /** The catalog. */
   models: Model[];
@@ -131,35 +71,117 @@ type ModelPickerProps = {
 };
 
 export function ModelPicker({ models, pick, picked, onPick }: ModelPickerProps) {
+  // The tab shown, apart from the pick: browsing another provider changes nothing
+  // until a model is picked there.
+  const [tab, setTab] = useState(picked.provider.id);
+  const providers = providersOf(models);
   const hasEffort = picked.efforts.length > 0;
+
   // Another model may not have the level this one is at, so the pick moves to the
-  // new model's default rather than to a name it happens to share.
+  // new model's default rather than to a name it happens to share. The group calls
+  // this only for a different model, so the picked one keeps its effort.
   const selectModel = (key: string) => {
     const next = models.find((m) => keyOf(m.provider.id, m.id) === key);
-    /* v8 ignore next -- the menu offers only the catalog's keys */
+    /* v8 ignore next -- the group offers only the catalog's keys */
     if (!next) return;
     onPick({ model: { providerID: next.provider.id, id: next.id }, effort: next.defaultEffort });
   };
+
   return (
-    <div className="flex min-w-0 items-center">
-      <Segment
-        label="Model"
-        value={keyOf(pick.model.providerID, pick.model.id)}
-        groups={groupByProvider(models)}
-        onSelect={selectModel}
-        leading={<ProviderMark id={picked.provider.id} label={picked.provider.label} />}
-        chevron={!hasEffort}
-      />
-      {/* A model with no such knob has nothing to show here. */}
-      {hasEffort && (
-        <Segment
-          label="Effort"
-          value={pick.effort}
-          groups={[{ options: picked.efforts.map((e) => ({ value: e, label: e })) }]}
-          onSelect={(effort) => onPick({ model: pick.model, effort })}
-          chevron
-        />
-      )}
-    </div>
+    <Popover onOpenChange={(open) => open && setTab(picked.provider.id)}>
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="min-w-0 shrink gap-1.5 px-1.5 text-sm font-normal text-muted-foreground"
+          />
+        }
+        aria-label={hasEffort ? `Model: ${picked.label}, effort: ${pick.effort}` : `Model: ${picked.label}`}
+      >
+        <ProviderMark id={picked.provider.id} label={picked.provider.label} />
+        <span className="truncate">{picked.label}</span>
+        {hasEffort && <span className="shrink-0 capitalize">{pick.effort}</span>}
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        sideOffset={6}
+        className="flex w-105 max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl bg-background p-0 shadow-lg dark:bg-card"
+        style={{ maxHeight: 'var(--available-height)' }}
+      >
+        {/* A catalog can outgrow the window: the model list alone shrinks and scrolls,
+            so the tabs, the effort and the footer stay in reach. */}
+        <div className="flex min-h-0 flex-col p-1">
+          {/* One provider needs no tabs. */}
+          {providers.length > 1 && (
+            <>
+              <div role="group" aria-label="Provider" className={TRACK}>
+                {providers.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    aria-pressed={p.id === tab}
+                    className={SEGMENT}
+                    onClick={() => setTab(p.id)}
+                  >
+                    <ProviderMark id={p.id} label={p.label} />
+                    <span className="truncate">{p.label}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="my-1 h-px bg-border" />
+            </>
+          )}
+          <SectionHeading label="Model" />
+          <RadioGroup
+            aria-label="Model"
+            className="min-h-0 overflow-y-auto"
+            value={keyOf(pick.model.providerID, pick.model.id)}
+            onValueChange={(key: string) => selectModel(key)}
+          >
+            {models
+              .filter((m) => m.provider.id === tab)
+              .map((m) => (
+                <Radio.Root
+                  key={m.id}
+                  value={keyOf(m.provider.id, m.id)}
+                  className="group flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-sm text-foreground hover:bg-muted data-checked:bg-muted data-checked:font-medium"
+                >
+                  <span className="flex size-4 shrink-0 items-center justify-center">
+                    <Check className="hidden size-4 group-data-checked:block" aria-hidden />
+                  </span>
+                  <span className="truncate">{m.label}</span>
+                </Radio.Root>
+              ))}
+          </RadioGroup>
+          {/* A model with no such knob has nothing to show here. */}
+          {hasEffort && (
+            <>
+              <div className="my-1 h-px bg-border" />
+              <SectionHeading label="Effort" />
+              <RadioGroup
+                aria-label="Effort"
+                className={`${TRACK} mb-1`}
+                value={pick.effort}
+                onValueChange={(effort: string) => onPick({ model: pick.model, effort })}
+              >
+                {picked.efforts.map((e) => (
+                  <Radio.Root key={e} value={e} className={`${SEGMENT} capitalize`}>
+                    {e}
+                  </Radio.Root>
+                ))}
+              </RadioGroup>
+            </>
+          )}
+        </div>
+        {/* Nothing manages providers yet, so the link leads nowhere. */}
+        <footer className="flex items-center border-t bg-muted/50 px-3 py-2">
+          <Button type="button" variant="link" size="xs" className="h-auto px-0 text-foreground">
+            Manage providers
+          </Button>
+        </footer>
+      </PopoverContent>
+    </Popover>
   );
 }
